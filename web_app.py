@@ -1097,8 +1097,10 @@ def warehouse():
               <div class="slot-code">{code}</div><div class="slot-info">{s["load_carrier_no"]}<br>{s["article_no"]}</div>
               <div class="slot-state">BELEGT</div></a>"""
         else:
-            html += f"""<div class="slot free"><div class="slot-code">{code}</div>
-              <div class="slot-info">Freier Lagerplatz</div><div class="slot-state">FREI</div></div>"""
+            html += f"""<a class="slot free" href="/manual-booking?slot_code={code}">
+              <div class="slot-code">{code}</div>
+              <div class="slot-info">Freier Lagerplatz<br><span class="muted">Zum Einlagern anklicken</span></div>
+              <div class="slot-state">FREI</div></a>"""
     html += "</div></div>"
     return page(html,"warehouse")
 
@@ -1892,72 +1894,115 @@ def manual_booking():
                         msg=prefix + f'{article["article_no"]} - {article["booking_article_name"]}: {cartons_on_pallet} Kartons auf {slot_code} gebucht.'
                         success=True
 
+    selected_slot = (request.form.get("slot_code","") if request.method=="POST" else request.args.get("slot_code","")).strip()
+
     articles=c.execute("""
         SELECT article_no,
                COALESCE(NULLIF(article_name,''), NULLIF(name,''), article_no) AS article_name,
-               cpp
+               COALESCE(cpp,1) AS cpp,
+               COALESCE(pallet_type,'Euro') AS pallet_type,
+               COALESCE(storage_rule,'Alle Ebenen') AS storage_rule
         FROM articles
-        ORDER BY article_no
-        LIMIT 500
+        ORDER BY article_name, article_no
+        LIMIT 1000
     """).fetchall()
     c.close()
 
-    html="""<div class="kicker">MANUELLE DIREKTBUCHUNG</div>
-    <h1 class="page-title">Artikel direkt auf Lagerplatz buchen</h1>
+    import json
+    article_data = {
+        a["article_no"]: {
+            "article_name": a["article_name"],
+            "cpp": a["cpp"],
+            "pallet_type": a["pallet_type"],
+            "storage_rule": a["storage_rule"]
+        } for a in articles
+    }
+    article_json = json.dumps(article_data, ensure_ascii=False).replace("</", "<\\/")
+
+    html=f"""<div class="kicker">MANUELLE DIREKTBUCHUNG</div>
+    <h1 class="page-title">Artikel auf Lagerplatz buchen</h1>
 
     <div class="notice">
-      <b>Artikelstamm wird automatisch mitgeführt.</b><br>
+      <b>Lagerplatz: {selected_slot or 'noch nicht gewählt'}</b><br>
       <span class="muted">
-        Du gibst Artikelnummer, Artikelname, Kartons auf der Palette und Lagerplatz ein.
-        Ist der Artikel neu, wird er automatisch angelegt. Ist er vorhanden, werden Name und Kartons pro Palette aktualisiert.
+        Wähle einen vorhandenen Artikel direkt aus dem Artikelstamm. Artikelnummer, Name und Kartons pro Palette werden automatisch übernommen.
+        Alternativ kannst du weiterhin einen neuen Artikel anlegen.
       </span>
     </div>
 
     <div class="card">
-      <form method="post">
-        Artikelnummer
-        <input class="scan-input" name="article_no" list="article-list" required autofocus placeholder="z. B. LD660807">
-
-        <datalist id="article-list">"""
+      <form method="post" id="booking-form">
+        <label>Artikel aus Artikelstamm auswählen</label>
+        <select class="scan-input" id="article_select">
+          <option value="">— Artikel auswählen —</option>"""
 
     for a in articles:
-        html += f'<option value="{a["article_no"]}">{a["article_name"]} - {a["cpp"]} Kartons/Palette</option>'
+        html += f'<option value="{a["article_no"]}">{a["article_name"]} · {a["article_no"]} · {a["cpp"]} Kartons/Palette</option>'
 
-    html += """</datalist>
+    html += f"""</select>
+        <div style="margin:8px 0 18px"><span class="muted">Du kannst die Liste öffnen und den gewünschten Artikel direkt anklicken.</span></div>
 
-        Artikelname
-        <input class="scan-input" name="article_name" required placeholder="z. B. Leichtgewichtrollator">
+        <div class="row">
+          <div>
+            Artikelnummer
+            <input class="scan-input" id="article_no" name="article_no" required placeholder="wird bei Auswahl automatisch übernommen">
+          </div>
+          <div>
+            Artikelname
+            <input class="scan-input" id="article_name" name="article_name" required placeholder="wird bei Auswahl automatisch übernommen">
+          </div>
+        </div>
 
         <div class="row">
           <div>
             Kartons auf Palette
-            <input class="scan-input" type="number" min="1" name="cartons_on_pallet" value="1" required>
-            <span class="muted">Wird gleichzeitig als „Kartons pro Palette“ im Artikelstamm gespeichert.</span>
+            <input class="scan-input" id="cartons_on_pallet" type="number" min="1" name="cartons_on_pallet" value="1" required>
+            <span class="muted">Bei vorhandenem Artikel aus dem Artikelstamm übernommen.</span>
           </div>
           <div>
             Lagerplatz
-            <input class="scan-input" name="slot_code" required placeholder="z. B. 22/3/37">
+            <input class="scan-input" name="slot_code" required value="{selected_slot}" placeholder="z. B. 22/3/37">
           </div>
         </div>
 
+        <div id="article_info" class="notice" style="display:none"></div>
         <button>Artikel auf Lagerplatz buchen</button>
       </form>
-    </div>"""
+    </div>
+
+    <div class="card">
+      <h2>Neuer Artikel?</h2>
+      <p class="muted">Wenn der Artikel noch nicht im Artikelstamm steht, lässt du die Auswahl oben leer und trägst Artikelnummer, Artikelname und Kartons auf Palette manuell ein. Beim Buchen wird der Artikel automatisch angelegt.</p>
+    </div>
+
+    <script>
+      const articles = {article_json};
+      const select = document.getElementById('article_select');
+      const no = document.getElementById('article_no');
+      const name = document.getElementById('article_name');
+      const cpp = document.getElementById('cartons_on_pallet');
+      const info = document.getElementById('article_info');
+
+      function fillArticle() {{
+        const a = articles[select.value];
+        if (!a) {{
+          info.style.display = 'none';
+          return;
+        }}
+        no.value = select.value;
+        name.value = a.article_name || '';
+        cpp.value = a.cpp || 1;
+        info.innerHTML = '<b>Aus Artikelstamm übernommen:</b> ' +
+          (a.pallet_type || 'Euro') + ' · ' + (a.storage_rule || 'Alle Ebenen') +
+          ' · ' + (a.cpp || 1) + ' Kartons/Palette';
+        info.style.display = 'block';
+      }}
+      select.addEventListener('change', fillArticle);
+    </script>"""
 
     if msg:
         cls="ok" if success else "danger"
         html += f'<div class="notice"><b class="{cls}">{msg}</b></div>'
-
-    html += """<div class="card">
-      <h2>Beispiel</h2>
-      <p>
-        Artikelnummer <b>LD660807</b> · Artikel <b>Leichtgewichtrollator</b> ·
-        <b>10 Kartons</b> · Lagerplatz <b>22/3/37</b>
-      </p>
-      <p class="muted">
-        Danach steht der Artikel automatisch im Artikelstamm und der Lagerplatz ist direkt gelb als belegt markiert.
-      </p>
-    </div>"""
 
     return page(html,"warehouse")
 
