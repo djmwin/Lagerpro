@@ -1,9 +1,9 @@
-# LagerPro V33 - Bilanz, Nachbestellung & automatische E-Mail-Meldungen
+# LagerPro V33 - Bilanz + Nachbestellung + automatische E-Mail-Benachrichtigungen
 from flask import Flask, request, redirect, session
 import sqlite3, os, math, json, shutil, secrets, smtplib, ssl
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from werkzeug.security import generate_password_hash, check_password_hash
-from email.message import EmailMessage
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("LAGERPRO_SECRET", secrets.token_hex(32))
@@ -86,6 +86,8 @@ def init_db():
     # Wir behalten beide Felder und synchronisieren vorhandene Werte.
     add_col("articles", "article_name TEXT")
     add_col("articles", "units_per_carton INTEGER NOT NULL DEFAULT 1")
+    add_col("articles", "min_stock INTEGER NOT NULL DEFAULT 0")
+    add_col("articles", "target_stock INTEGER NOT NULL DEFAULT 0")
     c.execute("""
         UPDATE articles
         SET article_name = COALESCE(NULLIF(article_name,''), name)
@@ -136,6 +138,8 @@ def init_db():
         created_at TEXT NOT NULL
     );
     """)
+    add_col("movements", "article_no TEXT")
+    add_col("movements", "quantity INTEGER NOT NULL DEFAULT 0")
 
     # Backfill article_count for old container positions if present.
     c.execute("""
@@ -230,6 +234,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS app_settings(setting_key TEXT PRIMARY KEY,setting_value TEXT,updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS backup_log(id INTEGER PRIMARY KEY AUTOINCREMENT,filename TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS stock_adjustments(id INTEGER PRIMARY KEY AUTOINCREMENT,carrier_id INTEGER,old_quantity INTEGER,new_quantity INTEGER,reason TEXT NOT NULL,requested_by TEXT,approved_by TEXT,status TEXT NOT NULL DEFAULT 'freigegeben',created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS reorder_alerts(id INTEGER PRIMARY KEY AUTOINCREMENT,article_no TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'offen',stock_at_alert INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,closed_at TEXT,email_sent_at TEXT);
+    CREATE TABLE IF NOT EXISTS email_log(id INTEGER PRIMARY KEY AUTOINCREMENT,event_type TEXT NOT NULL,recipient TEXT,subject TEXT,status TEXT NOT NULL,error_text TEXT,created_at TEXT NOT NULL);
     """)
     # Gang 1-7: 89 Positionen. Position 21-23: 3er statt 4er.
     for gang in range(1,8):
@@ -237,56 +243,6 @@ def init_db():
             for position in range(84,90):
                 c.execute("INSERT OR IGNORE INTO warehouse_slots(rack,level,position,capacity) VALUES(?,?,?,4)",(gang,level,position))
     c.execute("UPDATE warehouse_slots SET capacity=CASE WHEN position IN (21,22,23) THEN 3 ELSE 4 END")
-
-    # V33: Mindestbestand, Nachbestellungen, Bewegungsbilanz und E-Mail-Protokoll
-    add_col("articles", "min_stock INTEGER NOT NULL DEFAULT 0")
-    add_col("articles", "target_stock INTEGER NOT NULL DEFAULT 0")
-    add_col("containers", "completed_by TEXT")
-    add_col("containers", "completion_email_sent_at TEXT")
-    add_col("movements", "article_no TEXT")
-    add_col("movements", "article_name TEXT")
-    add_col("movements", "quantity INTEGER NOT NULL DEFAULT 0")
-    add_col("movements", "performed_by TEXT")
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS reorder_alerts(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        article_no TEXT NOT NULL,
-        current_stock INTEGER NOT NULL DEFAULT 0,
-        min_stock INTEGER NOT NULL DEFAULT 0,
-        target_stock INTEGER NOT NULL DEFAULT 0,
-        suggested_qty INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'offen',
-        email_status TEXT,
-        created_at TEXT NOT NULL,
-        resolved_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS notification_log(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_type TEXT NOT NULL,
-        entity_type TEXT,
-        entity_id TEXT,
-        recipient TEXT,
-        subject TEXT,
-        status TEXT NOT NULL,
-        error_text TEXT,
-        created_at TEXT NOT NULL
-    );
-    DROP TRIGGER IF EXISTS movements_fill_snapshot;
-    CREATE TRIGGER movements_fill_snapshot AFTER INSERT ON movements
-    BEGIN
-      UPDATE movements
-      SET article_no=COALESCE(NEW.article_no,(SELECT article_no FROM load_carriers WHERE id=NEW.load_carrier_id)),
-          article_name=COALESCE(NEW.article_name,(SELECT article_name FROM load_carriers WHERE id=NEW.load_carrier_id)),
-          quantity=CASE WHEN COALESCE(NEW.quantity,0)=0 THEN COALESCE((SELECT quantity FROM load_carriers WHERE id=NEW.load_carrier_id),0) ELSE NEW.quantity END,
-          performed_by=COALESCE(NEW.performed_by,'system')
-      WHERE id=NEW.id;
-    END;
-    """)
-    c.execute("""UPDATE movements SET
-        article_no=COALESCE(article_no,(SELECT article_no FROM load_carriers WHERE id=movements.load_carrier_id)),
-        article_name=COALESCE(article_name,(SELECT article_name FROM load_carriers WHERE id=movements.load_carrier_id)),
-        quantity=CASE WHEN COALESCE(quantity,0)=0 THEN COALESCE((SELECT quantity FROM load_carriers WHERE id=movements.load_carrier_id),0) ELSE quantity END
-    """)
     c.commit()
     c.close()
 
@@ -557,11 +513,73 @@ th{color:#aebed3}
 </style>
 """
 
+
+def get_settings(c=None):
+    own = c is None
+    if own: c=con()
+    vals={x['setting_key']:x['setting_value'] for x in c.execute("SELECT * FROM app_settings").fetchall()}
+    if own: c.close()
+    return vals
+
+def send_system_email(event_type, subject, body, recipients=None):
+    c=con(); cfg=get_settings(c)
+    if recipients is None:
+        raw=cfg.get('notification_emails','')
+        recipients=[x.strip() for x in raw.replace(';',',').split(',') if x.strip()]
+    if not recipients:
+        c.execute("INSERT INTO email_log(event_type,recipient,subject,status,error_text,created_at) VALUES(?,?,?,?,?,?)",(event_type,'',subject,'übersprungen','Keine Empfängeradresse konfiguriert',now_iso())); c.commit(); c.close(); return False
+    host=cfg.get('smtp_host','').strip(); user=cfg.get('smtp_user','').strip(); password=cfg.get('smtp_password',''); sender=cfg.get('smtp_sender','').strip() or user
+    try: port=int(cfg.get('smtp_port','587') or 587)
+    except: port=587
+    if not host or not sender:
+        err='SMTP-Server oder Absender fehlt in Einstellungen.'
+        for r in recipients: c.execute("INSERT INTO email_log(event_type,recipient,subject,status,error_text,created_at) VALUES(?,?,?,?,?,?)",(event_type,r,subject,'fehler',err,now_iso()))
+        c.commit(); c.close(); return False
+    try:
+        msg=EmailMessage(); msg['Subject']=subject; msg['From']=sender; msg['To']=', '.join(recipients); msg.set_content(body)
+        if cfg.get('smtp_ssl','0')=='1':
+            with smtplib.SMTP_SSL(host,port,timeout=15,context=ssl.create_default_context()) as srv:
+                if user: srv.login(user,password)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(host,port,timeout=15) as srv:
+                srv.ehlo()
+                if cfg.get('smtp_starttls','1')=='1': srv.starttls(context=ssl.create_default_context()); srv.ehlo()
+                if user: srv.login(user,password)
+                srv.send_message(msg)
+        for r in recipients: c.execute("INSERT INTO email_log(event_type,recipient,subject,status,created_at) VALUES(?,?,?,?,?)",(event_type,r,subject,'gesendet',now_iso()))
+        c.commit(); c.close(); return True
+    except Exception as e:
+        for r in recipients: c.execute("INSERT INTO email_log(event_type,recipient,subject,status,error_text,created_at) VALUES(?,?,?,?,?,?)",(event_type,r,subject,'fehler',str(e)[:500],now_iso()))
+        c.commit(); c.close(); return False
+
+def article_stock(c, article_no):
+    row=c.execute("SELECT COALESCE(SUM(quantity),0) FROM load_carriers WHERE article_no=? AND status!='ausgelagert' AND rack IS NOT NULL",(article_no,)).fetchone()
+    return int(row[0] or 0)
+
+def check_reorders():
+    c=con(); arts=c.execute("SELECT article_no,COALESCE(article_name,name,article_no) n,min_stock,target_stock FROM articles WHERE min_stock>0").fetchall(); notices=[]
+    for a in arts:
+        stock=article_stock(c,a['article_no']); open_alert=c.execute("SELECT * FROM reorder_alerts WHERE article_no=? AND status='offen' ORDER BY id DESC LIMIT 1",(a['article_no'],)).fetchone()
+        if stock <= int(a['min_stock'] or 0):
+            if not open_alert:
+                cur=c.execute("INSERT INTO reorder_alerts(article_no,status,stock_at_alert,created_at) VALUES(?,'offen',?,?)",(a['article_no'],stock,now_iso())); alert_id=cur.lastrowid; c.commit()
+                target=max(int(a['target_stock'] or 0),int(a['min_stock'] or 0)); suggested=max(0,target-stock)
+                notices.append((alert_id,a['article_no'],a['n'],stock,a['min_stock'],target,suggested))
+        elif open_alert:
+            c.execute("UPDATE reorder_alerts SET status='erledigt',closed_at=? WHERE id=?",(now_iso(),open_alert['id'])); c.commit()
+    c.close()
+    for alert_id,no,name,stock,min_s,target,suggested in notices:
+        subject=f"Nachbestellung erforderlich: {no} – {name}"
+        body=f"Artikel: {no} – {name}\nAktueller Bestand: {stock}\nMindestbestand: {min_s}\nSollbestand: {target}\nEmpfohlene Nachbestellmenge: {suggested}\nZeitpunkt: {now_iso()}\n\nLagerPro"
+        ok=send_system_email('nachbestellung',subject,body)
+        if ok:
+            c=con(); c.execute("UPDATE reorder_alerts SET email_sent_at=? WHERE id=?",(now_iso(),alert_id)); c.commit(); c.close()
+
 def bottom_nav(active):
     pages = [
         ("/","⌂","Dashboard","dashboard"),
         ("/articles","◈","Artikel","articles"),
-        ("/purchasing","!","Einkauf","purchasing"),
         ("/containers","▣","Container","containers"),
         ("/carriers","▤","Träger","carriers"),
         ("/warehouse","▦","Lager","warehouse"),
@@ -569,9 +587,8 @@ def bottom_nav(active):
         ("/archive","◷","Archiv","archive"),
         ("/more","⋯","Mehr","more"),
     ]
-    # V36 Entwicklungsmodus: Admin-Bereiche direkt sichtbar, kein Login erforderlich.
-    pages.append(("/settings","⚙","E-Mail","settings"))
-    pages.append(("/users","♙","Benutzer","users"))
+    if session.get('role') == 'Admin':
+        pages.append(("/users","♙","Benutzer","users"))
     html = '<div class="bottom-nav">'
     for url, icon, text, key in pages:
         cls = "active" if active == key else ""
@@ -580,11 +597,12 @@ def bottom_nav(active):
 
 def page(content, active="dashboard"):
     now = datetime.now()
-    # V36 Entwicklungsmodus: Oberfläche vollständig ohne Anmeldung anzeigen.
-    profile = (f'<div class="profile"><div class="avatar">DEV</div>'
-               f'<div class="datetime">{now.strftime("%d.%m.%Y")}<br>{now.strftime("%H:%M")} Uhr</div></div>')
-    nav = bottom_nav(active)
-    body_class = ""
+    logged_in = bool(session.get("user_id"))
+    # Ohne Anmeldung keine Navigation und keine Lagerdaten in der Oberfläche.
+    profile = (f'<div class="profile"><div class="avatar">{(session.get("username") or "LP")[:2].upper()}</div>'
+               f'<div class="datetime">{now.strftime("%d.%m.%Y")}<br>{now.strftime("%H:%M")} Uhr</div></div>') if logged_in else ""
+    nav = bottom_nav(active) if logged_in else ""
+    body_class = "" if logged_in else "auth-only"
     return f"""<!doctype html>
 <html>
 <head>
@@ -626,7 +644,6 @@ def dashboard():
     open_tasks = c.execute("SELECT COUNT(*) FROM tasks WHERE status='offen'").fetchone()[0]
     quarantine = c.execute("SELECT COUNT(*) FROM load_carriers WHERE quality_status='quarantaene'").fetchone()[0]
     sync_waiting = c.execute("SELECT COUNT(*) FROM sage_sync_queue WHERE status IN ('wartet','fehler')").fetchone()[0]
-    reorder_count = c.execute("SELECT COUNT(*) FROM reorder_alerts WHERE status='offen'").fetchone()[0]
     c.close()
 
     free = max(0, total_places - occupied - blocked)
@@ -652,7 +669,6 @@ def dashboard():
       <a class="action-card" href="/search"><b>⌕ Wo ist meine Ware?</b><span class="muted">Artikel · Seriennummer · Ladungsträger</span></a>
       <a class="action-card" href="/camera"><b>◉ Kamera-Scan</b><span class="muted">Träger, Artikel und Lagerplatz fotografieren</span></a>
       <a class="action-card" href="/manual-booking"><b>✎ Manuell buchen</b><span class="muted">Artikelnummer direkt auf Lagerplatz buchen</span></a>
-      <a class="action-card" href="/purchasing"><b>⚠ Nachbestellungen</b><span class="muted">{reorder_count} offene Einkaufswarnungen</span></a>
     </section>
 
     <section class="cards">
@@ -689,7 +705,6 @@ def dashboard():
         <div class="metric"><span class="muted">Offene Aufträge</span><strong>{open_tasks}</strong></div>
         <div class="metric"><span class="muted">Quarantäne</span><strong>{quarantine}</strong></div>
         <div class="metric"><span class="muted">Sage-Sync offen</span><strong>{sync_waiting}</strong></div>
-        <div class="metric"><span class="muted">Nachbestellen</span><strong>{reorder_count}</strong></div>
       </div>
       <div class="toolbar">
         <a class="small-btn" href="/tasks">Arbeitsaufträge</a>
@@ -785,288 +800,61 @@ def dashboard():
     return page(html, "dashboard")
 
 
-# ================= V33 BENACHRICHTIGUNG / BESTAND =================
-def setting_value(key, default=""):
-    c = con()
-    row = c.execute("SELECT setting_value FROM app_settings WHERE setting_key=?", (key,)).fetchone()
-    c.close()
-    return row["setting_value"] if row and row["setting_value"] is not None else default
-
-
-def _email_recipients(raw):
-    return [x.strip() for x in (raw or "").replace(";", ",").split(",") if x.strip()]
-
-
-def send_system_email(event_type, entity_type, entity_id, recipients, subject, body):
-    recipients = _email_recipients(recipients) if isinstance(recipients, str) else list(recipients or [])
-    enabled = setting_value("email_enabled", "0") == "1"
-    now = datetime.now().isoformat(timespec="seconds")
-    if not enabled or not recipients:
-        status = "deaktiviert" if not enabled else "kein_empfaenger"
-        c = con()
-        c.execute(
-            "INSERT INTO notification_log(event_type,entity_type,entity_id,recipient,subject,status,created_at) VALUES(?,?,?,?,?,?,?)",
-            (event_type, entity_type, str(entity_id), ", ".join(recipients), subject, status, now),
-        )
-        c.commit(); c.close()
-        return False, "E-Mail ist nicht aktiviert oder es ist kein Empfänger hinterlegt."
-
-    host = setting_value("smtp_host", "").strip()
-    try:
-        port = int(setting_value("smtp_port", "587") or 587)
-    except ValueError:
-        port = 587
-    user = setting_value("smtp_user", "").strip()
-    password = setting_value("smtp_password", "")
-    sender = setting_value("email_from", user).strip() or user
-    security = setting_value("smtp_security", "starttls").lower()
-    if not host or not sender:
-        return False, "SMTP-Host oder Absender fehlt in den Einstellungen."
-
-    msg = EmailMessage()
-    msg["From"] = sender
-    msg["To"] = ", ".join(recipients)
-    msg["Subject"] = subject
-    msg.set_content(body)
-    err = None
-    try:
-        if security == "ssl":
-            with smtplib.SMTP_SSL(host, port, timeout=15, context=ssl.create_default_context()) as smtp:
-                if user:
-                    smtp.login(user, password)
-                smtp.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=15) as smtp:
-                smtp.ehlo()
-                if security == "starttls":
-                    smtp.starttls(context=ssl.create_default_context())
-                    smtp.ehlo()
-                if user:
-                    smtp.login(user, password)
-                smtp.send_message(msg)
-        ok = True
-    except Exception as exc:
-        ok = False
-        err = f"{type(exc).__name__}: {exc}"
-
-    c = con()
-    c.execute(
-        "INSERT INTO notification_log(event_type,entity_type,entity_id,recipient,subject,status,error_text,created_at) VALUES(?,?,?,?,?,?,?,?)",
-        (event_type, entity_type, str(entity_id), ", ".join(recipients), subject, "gesendet" if ok else "fehler", err, now),
-    )
-    c.commit(); c.close()
-    return ok, err or "gesendet"
-
-
-def current_article_stock(article_no):
-    c = con()
-    row = c.execute(
-        """SELECT COALESCE(SUM(quantity),0) qty FROM load_carriers
-           WHERE article_no=? AND status!='ausgelagert' AND rack IS NOT NULL""",
-        (article_no,),
-    ).fetchone()
-    c.close()
-    return int(row["qty"] or 0)
-
-
-def evaluate_reorder(article_no):
-    if not article_no:
-        return None
-    c = con()
-    art = c.execute("SELECT * FROM articles WHERE article_no=?", (article_no,)).fetchone()
-    if not art:
-        c.close()
-        return None
-
-    min_stock = int(art["min_stock"] or 0)
-    target = max(min_stock, int(art["target_stock"] or 0))
-    stock = int(c.execute(
-        """SELECT COALESCE(SUM(quantity),0) FROM load_carriers
-           WHERE article_no=? AND status!='ausgelagert' AND rack IS NOT NULL""",
-        (article_no,),
-    ).fetchone()[0] or 0)
-    open_alert = c.execute(
-        "SELECT * FROM reorder_alerts WHERE article_no=? AND status='offen' ORDER BY id DESC LIMIT 1",
-        (article_no,),
-    ).fetchone()
-
-    # 0 = automatische Nachbestellung für diesen Artikel ausgeschaltet.
-    if min_stock <= 0:
-        if open_alert:
-            c.execute(
-                "UPDATE reorder_alerts SET status='erledigt',resolved_at=? WHERE id=?",
-                (datetime.now().isoformat(timespec="seconds"), open_alert["id"]),
-            )
-            c.commit()
-        c.close()
-        return None
-
-    if stock <= min_stock:
-        suggested = max(0, target - stock)
-        if open_alert:
-            c.execute(
-                "UPDATE reorder_alerts SET current_stock=?,min_stock=?,target_stock=?,suggested_qty=? WHERE id=?",
-                (stock, min_stock, target, suggested, open_alert["id"]),
-            )
-            c.commit(); c.close()
-            return open_alert["id"]
-
-        created_at = datetime.now().isoformat(timespec="seconds")
-        cur = c.execute(
-            """INSERT INTO reorder_alerts(article_no,current_stock,min_stock,target_stock,suggested_qty,status,created_at)
-               VALUES(?,?,?,?,?,'offen',?)""",
-            (article_no, stock, min_stock, target, suggested, created_at),
-        )
-        alert_id = cur.lastrowid
-        c.commit(); c.close()
-
-        name = art["article_name"] or art["name"] or article_no
-        subject = f"Nachbestellung erforderlich: {article_no} – {name}"
-        body = (
-            "Für folgenden Artikel ist der Mindestbestand erreicht oder unterschritten:\n\n"
-            f"Artikelnummer: {article_no}\n"
-            f"Artikel: {name}\n"
-            f"Aktueller Bestand: {stock}\n"
-            f"Mindestbestand: {min_stock}\n"
-            f"Sollbestand: {target}\n"
-            f"Empfohlene Nachbestellmenge: {suggested}\n\n"
-            f"Meldung aus LagerPro am {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}."
-        )
-        ok, info = send_system_email(
-            "nachbestellung", "article", article_no,
-            setting_value("purchasing_emails", ""), subject, body,
-        )
-        c = con()
-        c.execute(
-            "UPDATE reorder_alerts SET email_status=? WHERE id=?",
-            ("gesendet" if ok else info, alert_id),
-        )
-        c.commit(); c.close()
-        return alert_id
-
-    if open_alert:
-        c.execute(
-            "UPDATE reorder_alerts SET status='erledigt',resolved_at=?,current_stock=? WHERE id=?",
-            (datetime.now().isoformat(timespec="seconds"), stock, open_alert["id"]),
-        )
-        c.commit()
-    c.close()
-    return None
-
-
-def complete_container_and_notify(cid):
-    c = con()
-    cont = c.execute("SELECT * FROM containers WHERE id=?", (cid,)).fetchone()
-    if not cont:
-        c.close()
-        return False, "Container nicht gefunden."
-
-    now = datetime.now().isoformat(timespec="seconds")
-    completed_by = session.get("username") or "system"
-    was_sent = bool(cont["completion_email_sent_at"])
-    c.execute(
-        "UPDATE containers SET status='erledigt',unload_finished_at=COALESCE(unload_finished_at,?),completed_by=? WHERE id=?",
-        (now, completed_by, cid),
-    )
-    c.commit(); c.close()
-
-    if was_sent:
-        return True, "Container ist erledigt; die Fertigmeldung wurde bereits per E-Mail versendet."
-
-    gate = cont["gate_no"] or "–"
-    subject = f"Container fertig: {cont['container_no']} an Tor {gate}"
-    body = (
-        f"Der Container {cont['container_no']} wurde fertig gebucht.\n\n"
-        f"Tor: {gate}\n"
-        f"Fertiggestellt: {datetime.now().strftime('%d.%m.%Y um %H:%M Uhr')}\n"
-        f"Gebucht von: {completed_by}\n"
-        "Status: erledigt\n"
-    )
-    ok, info = send_system_email(
-        "container_fertig", "container", cid,
-        setting_value("supervisor_emails", ""), subject, body,
-    )
-    if ok:
-        c = con()
-        c.execute("UPDATE containers SET completion_email_sent_at=? WHERE id=?", (now, cid))
-        c.commit(); c.close()
-        return True, "Container fertig gebucht. Fertigmeldung wurde per E-Mail versendet."
-    return True, "Container fertig gebucht. E-Mail konnte nicht versendet werden: " + str(info)
-
-
-# ================= ENDE V33 HELFER =================
-
 @app.route("/articles", methods=["GET", "POST"])
 def articles():
     c = con()
     if request.method == "POST":
         units = max(1, int(request.form.get("units_per_carton", 1)))
-        min_stock = max(0, int(request.form.get("min_stock", 0) or 0))
-        target_stock = max(min_stock, int(request.form.get("target_stock", 0) or 0))
-        no = request.form["no"].strip()
-        name = request.form["name"].strip()
-        c.execute(
-            """INSERT INTO articles(article_no,name,article_name,pallet_type,cpp,storage_rule,units_per_carton,min_stock,target_stock)
-               VALUES(?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(article_no) DO UPDATE SET
-                 name=excluded.name, article_name=excluded.article_name,
-                 pallet_type=excluded.pallet_type, storage_rule=excluded.storage_rule,
-                 units_per_carton=excluded.units_per_carton,
-                 min_stock=excluded.min_stock, target_stock=excluded.target_stock""",
-            (no, name, name, request.form["ptype"], 1, request.form["rule"], units, min_stock, target_stock),
-        )
+        c.execute("""
+        INSERT INTO articles(article_no,name,pallet_type,cpp,storage_rule,units_per_carton)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(article_no) DO UPDATE SET
+          name=excluded.name,
+          pallet_type=excluded.pallet_type,
+          storage_rule=excluded.storage_rule,
+          units_per_carton=excluded.units_per_carton
+        """, (
+            request.form["no"].strip(),
+            request.form["name"].strip(),
+            request.form["ptype"],
+            1,
+            request.form["rule"],
+            units
+        ))
         c.commit(); c.close()
-        evaluate_reorder(no)
         return redirect("/articles")
 
-    edit_no = request.args.get("edit", "").strip()
-    edit = c.execute("SELECT * FROM articles WHERE article_no=?", (edit_no,)).fetchone() if edit_no else None
-    rows = c.execute(
-        """SELECT a.*,
-           COALESCE((SELECT SUM(lc.quantity) FROM load_carriers lc
-                     WHERE lc.article_no=a.article_no AND lc.status!='ausgelagert' AND lc.rack IS NOT NULL),0) current_stock
-           FROM articles a ORDER BY a.article_no"""
-    ).fetchall()
+    rows = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
     c.close()
-
-    eno = edit["article_no"] if edit else ""
-    ename = (edit["article_name"] or edit["name"] or "") if edit else ""
-    eunits = int(edit["units_per_carton"] or 1) if edit else 1
-    emin = int(edit["min_stock"] or 0) if edit else 0
-    etarget = int(edit["target_stock"] or 0) if edit else 0
-    eptype = (edit["pallet_type"] or "Euro") if edit else "Euro"
-    erule = (edit["storage_rule"] or "Alle Ebenen") if edit else "Alle Ebenen"
-    ptype_opts = ''.join(f'<option {"selected" if v==eptype else ""}>{v}</option>' for v in ["Euro","Einweg","Einweg 115 x 115"])
-    rule_opts = ''.join(f'<option {"selected" if v==erule else ""}>{v}</option>' for v in ["Alle Ebenen","Nur Ebene 1","Nur Ebene 2-4"])
-    title = "Artikel bearbeiten" if edit else "Neuen Artikel anlegen"
-    cancel = '<a class="small-btn" href="/articles">Abbrechen</a>' if edit else ''
-
-    html = f"""
+    html = """
     <div class="kicker">ARTIKELSTAMM</div>
     <h1 class="page-title">Artikel verwalten</h1>
-    <div class="notice"><b>Bestandsautomatik:</b> Mindestbestand und Sollbestand können bei jedem vorhandenen Artikel jederzeit über <b>Bearbeiten</b> geändert werden. Bei Erreichen/Unterschreiten wird die Nachbestellung ausgelöst.</div>
-    <div class="card"><h2>{title}</h2><form method="post">
-      <div class="row"><div>Artikelnummer<input name="no" value="{eno}" required {'readonly' if edit else ''}></div><div>Artikelname<input name="name" value="{ename}" required></div></div>
-      <div class="row"><div>Artikel pro Karton<input type="number" min="1" name="units_per_carton" value="{eunits}" required></div>
-      <div>Palettentyp<select name="ptype">{ptype_opts}</select></div></div>
-      <div class="row"><div><b>Mindestbestand</b><input type="number" min="0" name="min_stock" value="{emin}"><span class="muted">Bei diesem Bestand oder darunter: Nachbestellmeldung + E-Mail. 0 = aus.</span></div>
-      <div><b>Sollbestand</b><input type="number" min="0" name="target_stock" value="{etarget}"><span class="muted">Bis zu diesem Bestand soll der Einkauf wieder auffüllen.</span></div></div>
-      Lageregel<select name="rule">{rule_opts}</select>
-      <button>{'Änderungen speichern' if edit else 'Artikel speichern'}</button> {cancel}
-    </form></div>
-    <div class="card"><table><tr><th>Nr.</th><th>Name</th><th>Bestand</th><th>Min.</th><th>Soll</th><th>Status</th><th>Palette</th><th>Aktion</th></tr>
+    <div class="card">
+      <form method="post">
+        <div class="row">
+          <div>Artikelnummer<input name="no" required></div>
+          <div>Artikelname<input name="name" required></div>
+        </div>
+        <div class="row">
+          <div>Artikel pro Karton<input type="number" min="1" name="units_per_carton" required></div>
+          <div>Palettentyp<select name="ptype">
+            <option>Euro</option><option>Einweg</option><option>Einweg 115 x 115</option>
+          </select></div>
+        </div>
+        Lageregel
+        <select name="rule">
+          <option>Alle Ebenen</option><option>Nur Ebene 1</option><option>Nur Ebene 2-4</option>
+        </select>
+        <button>Artikel speichern</button>
+      </form>
+    </div>
+    <div class="card"><table>
+      <tr><th>Nr.</th><th>Name</th><th>Artikel/Karton</th><th>Palette</th><th>Regel</th></tr>
     """
     for x in rows:
-        current = int(x["current_stock"] or 0)
-        minimum = int(x["min_stock"] or 0)
-        if minimum > 0 and current <= minimum:
-            state = '<span class="pill red">NACHBESTELLEN</span>'
-        elif minimum > 0 and current <= max(minimum + 1, int(minimum * 1.25)):
-            state = '<span class="pill yellow">KNAPP</span>'
-        else:
-            state = '<span class="pill green">OK</span>'
-        html += f'<tr><td>{x["article_no"]}</td><td>{x["name"]}</td><td><b>{current}</b></td><td>{x["min_stock"]}</td><td>{x["target_stock"]}</td><td>{state}</td><td>{x["pallet_type"]}</td><td><a class="small-btn" href="/articles?edit={x["article_no"]}">Bearbeiten</a></td></tr>'
-    html += '</table><p><a class="yellow-link" href="/purchasing">→ Einkauf / Nachbestellliste öffnen</a></p></div>'
+        html += f"""<tr><td>{x["article_no"]}</td><td>{x["name"]}</td>
+        <td><b>{x["units_per_carton"]}</b></td><td>{x["pallet_type"]}</td><td>{x["storage_rule"]}</td></tr>"""
+    html += "</table></div>"
     return page(html, "articles")
 
 
@@ -1092,7 +880,7 @@ def containers():
       <div class="row"><div>Tor<select name="gate"><option value="">Kein Tor</option>{gates}</select></div>
       <div>Status<select name="status">
         <option>geplant</option><option>vor Ort</option><option>verspätet</option>
-        <option>Entladung</option><option>bereit</option>
+        <option>Entladung</option><option>bereit</option><option>erledigt</option>
       </select></div></div>
       <button>Container anlegen</button>
     </form></div>
@@ -1110,89 +898,60 @@ def container_detail(cid):
     c = con()
     cont = c.execute("SELECT * FROM containers WHERE id=?", (cid,)).fetchone()
     if not cont:
-        c.close()
-        return redirect("/containers")
-    message = session.pop("container_message", "")
+        c.close(); return redirect("/containers")
 
     if request.method == "POST":
-        action = request.form.get("action", "item")
-        if action == "complete":
-            c.close()
-            _, message = complete_container_and_notify(cid)
-            session["container_message"] = message
-            return redirect(f"/container/{cid}")
-        if action == "status":
-            status = request.form.get("status", "geplant")
-            gate = int(request.form["gate_no"]) if request.form.get("gate_no") else None
-            c.execute("UPDATE containers SET status=?,gate_no=? WHERE id=?", (status, gate, cid))
-            c.commit(); c.close()
-            return redirect(f"/container/{cid}")
-
-        art = c.execute("SELECT * FROM articles WHERE article_no=?", (request.form["article"],)).fetchone()
+        art = c.execute("SELECT * FROM articles WHERE article_no=?",
+                        (request.form["article"],)).fetchone()
         if art:
             cartons = max(1, int(request.form["cartons"]))
             upc = max(1, int(art["units_per_carton"]))
             count = cartons * upc
-            c.execute(
-                """INSERT INTO items(container_id,article_no,name,cartons,cpp,pallet_type,units_per_carton,article_count)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (cid, art["article_no"], art["name"], cartons, 1, art["pallet_type"], upc, count),
-            )
+            c.execute("""INSERT INTO items
+                (container_id,article_no,name,cartons,cpp,pallet_type,units_per_carton,article_count)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (cid,art["article_no"],art["name"],cartons,1,art["pallet_type"],upc,count))
             c.commit()
-        c.close()
-        return redirect(f"/container/{cid}")
+        c.close(); return redirect(f"/container/{cid}")
 
     arts = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
-    items = c.execute("SELECT * FROM items WHERE container_id=? ORDER BY id DESC", (cid,)).fetchall()
-    carriers = c.execute("SELECT * FROM load_carriers WHERE container_id=? ORDER BY id DESC", (cid,)).fetchall()
+    items = c.execute("SELECT * FROM items WHERE container_id=? ORDER BY id DESC",(cid,)).fetchall()
+    carriers = c.execute("SELECT * FROM load_carriers WHERE container_id=? ORDER BY id DESC",(cid,)).fetchall()
     c.close()
 
-    gates = ''.join(f'<option value="{g}" {"selected" if cont["gate_no"]==g else ""}>Tor {g}</option>' for g in range(8,13))
-    statuses = ['geplant', 'vor Ort', 'verspätet', 'Entladung', 'bereit']
-    status_options = ''.join(f'<option value="{st}" {"selected" if cont["status"]==st else ""}>{st}</option>' for st in statuses)
     html = f"""
     <div class="kicker">CONTAINERDETAIL</div><h1 class="page-title">{cont["container_no"]}</h1>
-    {f'<div class="notice"><b>{message}</b></div>' if message else ''}
-    <div class="card"><div class="row">
-      <div><b>Tor {cont["gate_no"] or "–"}</b><br><span class="badge">{cont["status"]}</span></div>
-      <div><form method="post"><input type="hidden" name="action" value="status">
-        <select name="gate_no"><option value="">Kein Tor</option>{gates}</select>
-        <select name="status">{status_options}</select><button>Status / Tor speichern</button>
-      </form></div>
-    </div></div>
-    <div class="card"><h2>Container fertig?</h2>
-      <p class="muted">Beim Fertigbuchen wird der Status auf erledigt gesetzt und automatisch eine E-Mail an den hinterlegten Vorgesetzten gesendet. Die Mail enthält Container, Tor, Zeitpunkt und Benutzer.</p>
-      <form method="post"><input type="hidden" name="action" value="complete">
-        <button {'disabled' if cont['status']=='erledigt' and cont['completion_email_sent_at'] else ''}>{'↻ Fertigmeldung per E-Mail erneut senden' if cont['status']=='erledigt' and not cont['completion_email_sent_at'] else '✓ Container fertig buchen & E-Mail senden'}</button>
-      </form>
-      {f'<p class="ok">E-Mail versendet: {cont["completion_email_sent_at"]}</p>' if cont['completion_email_sent_at'] else (f'<p class="warn">Container ist fertig, aber die E-Mail wurde noch nicht erfolgreich versendet. Du kannst sie oben erneut senden.</p>' if cont['status']=='erledigt' else '')}
-    </div>
+    <div class="card"><b>Tor {cont["gate_no"] or "–"}</b> &nbsp; <span class="badge">{cont["status"]}</span></div>
+    <div class="card"><form method="post" action="/container/{cid}/finish" onsubmit="return confirm('Container wirklich als fertig markieren?')"><button>✓ Container fertig buchen & E-Mail senden</button></form><p class="muted">Beim Abschluss wird der konfigurierte Vorgesetzte automatisch per E-Mail informiert.</p></div>
     <div class="card"><h2>Ware erfassen</h2>
-      <p class="muted">Kartonanzahl wird im Wareneingang erfasst. Der Bestand wird als Artikelanzahl geführt.</p>
+    <p class="muted">Kartonanzahl wird nur im Wareneingang erfasst. Der Bestand wird als Artikelanzahl geführt.</p>
     """
     if arts:
-        html += '<form method="post"><input type="hidden" name="action" value="item">Artikel<select name="article">'
+        html += '<form method="post">Artikel<select name="article">'
         for a in arts:
             html += f'<option value="{a["article_no"]}">{a["article_no"]} – {a["name"]} · {a["units_per_carton"]} Artikel/Karton</option>'
         html += '</select>Kartonanzahl<input type="number" min="1" name="cartons" required><button>Ware übernehmen</button></form>'
     else:
         html += '<p class="muted">Bitte zuerst einen Artikel anlegen.</p>'
-
-    html += '</div><div class="card"><h2>Containerinhalt</h2><table><tr><th>Artikel</th><th>Kartons</th><th>Artikel/Karton</th><th>Artikelanzahl</th></tr>'
+    html += """</div><div class="card"><h2>Containerinhalt</h2>
+      <table><tr><th>Artikel</th><th>Kartons</th><th>Artikel/Karton</th><th>Artikelanzahl</th></tr>"""
     total_units = 0
     for x in items:
         total_units += x["article_count"]
-        html += f'<tr><td>{x["article_no"]}<br><span class="muted">{x["name"]}</span></td><td>{x["cartons"]}</td><td>{x["units_per_carton"]}</td><td><b>{x["article_count"]}</b></td></tr>'
-    html += f'</table><h3>Gesamte Artikelanzahl: {total_units}</h3></div>'
-    html += f'<div class="card"><div class="section-head"><h2>Ladungsträger</h2><a class="yellow-link" href="/carriers/new?container_id={cid}">+ Ladungsträger scannen →</a></div>'
+        html += f"""<tr><td>{x["article_no"]}<br><span class="muted">{x["name"]}</span></td>
+        <td>{x["cartons"]}</td><td>{x["units_per_carton"]}</td><td><b>{x["article_count"]}</b></td></tr>"""
+    html += f"</table><h3>Gesamte Artikelanzahl: {total_units}</h3></div>"
+    html += f"""<div class="card"><div class="section-head"><h2>Ladungsträger</h2>
+      <a class="yellow-link" href="/carriers/new?container_id={cid}">+ Ladungsträger scannen →</a></div>"""
     if carriers:
-        html += '<table><tr><th>Träger</th><th>Artikel</th><th>Menge</th><th>Status</th></tr>'
+        html += "<table><tr><th>Träger</th><th>Artikel</th><th>Menge</th><th>Status</th></tr>"
         for lt in carriers:
-            html += f'<tr><td><a style="color:white" href="/carrier/{lt["id"]}">{lt["carrier_no"]}</a></td><td>{lt["article_no"] or "–"}</td><td>{lt["quantity"]}</td><td>{lt["status"]}</td></tr>'
-        html += '</table>'
+            html += f"""<tr><td><a style="color:white" href="/carrier/{lt["id"]}">{lt["carrier_no"]}</a></td>
+            <td>{lt["article_no"] or "–"}</td><td>{lt["quantity"]}</td><td>{lt["status"]}</td></tr>"""
+        html += "</table>"
     else:
         html += '<p class="muted">Noch kein Ladungsträger für diesen Container.</p>'
-    html += '</div>'
+    html += "</div>"
     return page(html, "containers")
 
 
@@ -1312,12 +1071,8 @@ def carrier_detail(lid):
             html += '<div class="card"><form method="post"><input type="hidden" name="action" value="close"><button>Ladungsträger abschließen</button></form></div>'
         elif not lt["rack"]:
             html += f'<div class="card"><a class="yellow-link" href="/store?carrier={lt["carrier_no"]}">Weiter zur Einlagerung →</a></div>'
-    if lt["rack"] and lt["status"] != "ausgelagert":
-        html += f"""<div class="card"><h2>Auslagerung</h2>
-        <p class="muted">Bucht den kompletten Ladungsträger aus, gibt den Lagerplatz frei und aktualisiert Nachbestellmeldungen.</p>
-        <form method="post" action="/carrier/{lid}/outbound" onsubmit="return confirm('Ladungsträger wirklich auslagern?')">
-          <button>↑ Ladungsträger auslagern</button>
-        </form></div>"""
+        if lt["rack"] and lt["status"]=="eingelagert":
+            html += f'<div class="card"><h2>Warenausgang</h2><form method="post" action="/carrier/{lid}/outbound" onsubmit="return confirm(\'Ladungsträger wirklich auslagern?\')"><button>↑ Ladungsträger auslagern</button></form></div>'
     html += f"""
     <div class="card">
       <h2>Qualitätsstatus</h2>
@@ -1352,37 +1107,6 @@ def parse_slot(code):
     except (TypeError, ValueError):
         pass
     return None
-
-
-@app.route("/carrier/<int:lid>/outbound", methods=["POST"])
-def carrier_outbound(lid):
-    c = con()
-    lt = c.execute("SELECT * FROM load_carriers WHERE id=?", (lid,)).fetchone()
-    if not lt:
-        c.close()
-        return redirect("/carriers")
-    article_no = lt["article_no"]
-    if lt["status"] != "ausgelagert":
-        old = f'{lt["rack"]}/{lt["level"]}/{lt["position"]}' if lt["rack"] else None
-        now = datetime.now().isoformat(timespec="seconds")
-        c.execute(
-            """UPDATE warehouse_slots SET article_no=NULL,article_name=NULL,pallet_type=NULL,quantity=NULL,
-               container_id=NULL,occupied_at=NULL,load_carrier_no=NULL,load_carrier_id=NULL,slot_status='frei'
-               WHERE load_carrier_id=?""",
-            (lid,),
-        )
-        c.execute("UPDATE load_carriers SET status='ausgelagert',rack=NULL,level=NULL,position=NULL WHERE id=?", (lid,))
-        c.execute(
-            """INSERT INTO movements(load_carrier_id,carrier_no,movement_type,from_slot,to_slot,created_at,
-               article_no,article_name,quantity,performed_by) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (lid, lt["carrier_no"], "Auslagerung", old, None, now, lt["article_no"], lt["article_name"], lt["quantity"], session.get("username") or "system"),
-        )
-        c.commit()
-    c.close()
-    if article_no:
-        evaluate_reorder(article_no)
-    audit('Auslagerung', 'carrier', lid, after={'article_no': article_no})
-    return redirect(f"/carrier/{lid}")
 
 
 @app.route("/store", methods=["GET","POST"])
@@ -1441,12 +1165,9 @@ def store():
                     c.execute("""UPDATE load_carriers SET rack=?,level=?,position=?,status='eingelagert',stored_at=?
                                  WHERE id=?""",(r,l,p,now,lt["id"]))
                     c.execute("""INSERT INTO movements(load_carrier_id,carrier_no,movement_type,from_slot,to_slot,created_at)
-                                 VALUES(?,?,?,?,?,?)""",(lt["id"],lt["carrier_no"],("Umlagerung" if old else "Einlagerung"),old,slot_code,now))
+                                 VALUES(?,?,?,?,?,?)""",(lt["id"],lt["carrier_no"],"Einlagerung/Umlagerung",old,slot_code,now))
                     c.commit()
-                    article_no_for_reorder = lt["article_no"]
                     c.close()
-                    if article_no_for_reorder:
-                        evaluate_reorder(article_no_for_reorder)
                     return redirect(f"/carrier/{lt['id']}")
         c.close()
     html=f"""<div class="kicker">SCAN 3/3</div><h1 class="page-title">Einlagern</h1>
@@ -1459,6 +1180,15 @@ def store():
     html += '<div class="card"><p class="muted">Die App prüft Belegung, Ebenenregel und Euro/Einweg-Nachbarschaft vor der Buchung.</p></div>'
     return page(html,"warehouse")
 
+
+@app.route('/carrier/<int:lid>/outbound',methods=['POST'])
+def outbound_carrier(lid):
+    c=con(); lt=c.execute("SELECT * FROM load_carriers WHERE id=?",(lid,)).fetchone()
+    if not lt: c.close(); return redirect('/stock')
+    old=f"{lt['rack']}/{lt['level']}/{lt['position']}" if lt['rack'] else None; now=now_iso()
+    c.execute("UPDATE warehouse_slots SET article_no=NULL,article_name=NULL,pallet_type=NULL,quantity=NULL,container_id=NULL,occupied_at=NULL,load_carrier_no=NULL,load_carrier_id=NULL,slot_status='frei' WHERE load_carrier_id=?",(lid,))
+    c.execute("UPDATE load_carriers SET status='ausgelagert',rack=NULL,level=NULL,position=NULL WHERE id=?",(lid,))
+    c.execute("INSERT INTO movements(load_carrier_id,carrier_no,movement_type,article_no,quantity,from_slot,created_at) VALUES(?,?,?,?,?,?,?)",(lid,lt['carrier_no'],'Auslagerung',lt['article_no'],lt['quantity'],old,now)); c.commit(); c.close(); check_reorders(); audit('Auslagerung','carrier',lid); return redirect('/stock')
 
 @app.route("/warehouse")
 def warehouse():
@@ -1768,103 +1498,20 @@ def sync_page():
 
 @app.route("/reports")
 def reports():
-    today = datetime.now().date()
-    default_start = today.replace(day=1).isoformat()
-    start_date = request.args.get("start", default_start)
-    end_date = request.args.get("end", today.isoformat())
-    c = con()
-    params = (start_date + "T00:00:00", end_date + "T23:59:59")
-    row = c.execute(
-        """SELECT
-           COALESCE(SUM(CASE WHEN (LOWER(movement_type) LIKE '%einlager%' OR movement_type='Manuelle Direktbuchung') THEN quantity ELSE 0 END),0) inbound_qty,
-           COALESCE(SUM(CASE WHEN LOWER(movement_type) LIKE '%auslager%' THEN quantity ELSE 0 END),0) outbound_qty,
-           SUM(CASE WHEN (LOWER(movement_type) LIKE '%einlager%' OR movement_type='Manuelle Direktbuchung') THEN 1 ELSE 0 END) inbound_moves,
-           SUM(CASE WHEN LOWER(movement_type) LIKE '%auslager%' THEN 1 ELSE 0 END) outbound_moves
-           FROM movements WHERE created_at BETWEEN ? AND ?""",
-        params,
-    ).fetchone()
-    per_article = c.execute(
-        """SELECT COALESCE(article_no,'–') article_no,COALESCE(article_name,'Unbekannt') article_name,
-           COALESCE(SUM(CASE WHEN (LOWER(movement_type) LIKE '%einlager%' OR movement_type='Manuelle Direktbuchung') THEN quantity ELSE 0 END),0) inbound_qty,
-           COALESCE(SUM(CASE WHEN LOWER(movement_type) LIKE '%auslager%' THEN quantity ELSE 0 END),0) outbound_qty
-           FROM movements WHERE created_at BETWEEN ? AND ? AND article_no IS NOT NULL
-           GROUP BY article_no,article_name
-           HAVING inbound_qty>0 OR outbound_qty>0 ORDER BY article_name""",
-        params,
-    ).fetchall()
-    reorder_count = c.execute("SELECT COUNT(*) FROM reorder_alerts WHERE status='offen'").fetchone()[0]
-    inv_diff = c.execute("SELECT COUNT(*) FROM inventory_checks WHERE result='DIFFERENZ'").fetchone()[0]
-    open_tasks = c.execute("SELECT COUNT(*) FROM tasks WHERE status='offen'").fetchone()[0]
-    c.close()
-
-    inbound = int(row["inbound_qty"] or 0)
-    outbound = int(row["outbound_qty"] or 0)
-    net = inbound - outbound
-    trs = ''.join(
-        f'<tr><td>{x["article_no"]}</td><td>{x["article_name"]}</td><td class="ok"><b>{x["inbound_qty"]}</b></td><td class="danger"><b>{x["outbound_qty"]}</b></td><td><b>{int(x["inbound_qty"] or 0)-int(x["outbound_qty"] or 0)}</b></td></tr>'
-        for x in per_article
-    )
-    html = f"""
-    <div class="kicker">BILANZ & BERICHTE</div><h1 class="page-title">Einlagerung ↔ Auslagerung</h1>
-    <div class="card"><form method="get"><div class="row"><div>Von<input type="date" name="start" value="{start_date}"></div><div>Bis<input type="date" name="end" value="{end_date}"></div></div><button>Zeitraum auswerten</button></form></div>
-    <div class="metric-grid">
-      <div class="metric"><span class="muted">Eingelagert</span><strong>{inbound}</strong><span class="muted">Artikel · {row["inbound_moves"] or 0} Buchungen</span></div>
-      <div class="metric"><span class="muted">Ausgelagert</span><strong>{outbound}</strong><span class="muted">Artikel · {row["outbound_moves"] or 0} Buchungen</span></div>
-      <div class="metric"><span class="muted">Differenz Zeitraum</span><strong>{net}</strong></div>
-      <div class="metric"><span class="muted">Offene Nachbestellungen</span><strong>{reorder_count}</strong><a class="yellow-link" href="/purchasing">Einkauf →</a></div>
-      <div class="metric"><span class="muted">Inventurdifferenzen</span><strong>{inv_diff}</strong></div>
-      <div class="metric"><span class="muted">Offene Aufträge</span><strong>{open_tasks}</strong></div>
-    </div>
-    <div class="card"><h2>Bilanz pro Artikel</h2><table><tr><th>Nr.</th><th>Artikel</th><th>Eingelagert</th><th>Ausgelagert</th><th>Differenz</th></tr>
-      {trs or '<tr><td colspan="5" class="muted">Im gewählten Zeitraum noch keine Ein-/Auslagerungen.</td></tr>'}
-    </table></div>
-    """
-    return page(html, "dashboard")
-
-
-@app.route("/purchasing")
-def purchasing_page():
-    c = con()
-    article_nos = [r[0] for r in c.execute("SELECT article_no FROM articles WHERE min_stock>0").fetchall()]
-    c.close()
-    for no in article_nos:
-        evaluate_reorder(no)
-
-    c = con()
-    rows = c.execute(
-        """SELECT a.article_no,COALESCE(a.article_name,a.name) article_name,a.min_stock,a.target_stock,
-           COALESCE((SELECT SUM(lc.quantity) FROM load_carriers lc
-                     WHERE lc.article_no=a.article_no AND lc.status!='ausgelagert' AND lc.rack IS NOT NULL),0) current_stock,
-           ra.created_at,ra.email_status
-           FROM articles a
-           LEFT JOIN reorder_alerts ra ON ra.id=(
-               SELECT id FROM reorder_alerts r2 WHERE r2.article_no=a.article_no AND r2.status='offen' ORDER BY id DESC LIMIT 1
-           )
-           WHERE a.min_stock>0 AND COALESCE((SELECT SUM(lc.quantity) FROM load_carriers lc
-                     WHERE lc.article_no=a.article_no AND lc.status!='ausgelagert' AND lc.rack IS NOT NULL),0)<=a.min_stock
-           ORDER BY current_stock ASC,a.article_name"""
-    ).fetchall()
-    hist = c.execute("SELECT * FROM reorder_alerts ORDER BY id DESC LIMIT 50").fetchall()
-    c.close()
-
-    trs = ''
-    for x in rows:
-        suggested = max(0, int(x['target_stock'] or 0) - int(x['current_stock'] or 0))
-        trs += f'<tr><td><span class="pill red">NACHBESTELLEN</span></td><td>{x["article_no"]}</td><td>{x["article_name"]}</td><td><b>{x["current_stock"]}</b></td><td>{x["min_stock"]}</td><td>{x["target_stock"]}</td><td><b>{suggested}</b></td><td>{x["email_status"] or "–"}</td></tr>'
-    htrs = ''.join(
-        f'<tr><td>{x["created_at"]}</td><td>{x["article_no"]}</td><td>{x["current_stock"]}</td><td>{x["min_stock"]}</td><td>{x["suggested_qty"]}</td><td>{x["status"]}</td><td>{x["email_status"] or "–"}</td></tr>'
-        for x in hist
-    )
-    html = f"""
-    <div class="kicker">EINKAUF</div><h1 class="page-title">Nachbestellliste</h1>
-    <div class="notice"><b>Automatik:</b> Sobald ein Artikel den Mindestbestand erreicht oder unterschreitet, wird genau eine offene Nachbestellmeldung angelegt. Eine neue E-Mail entsteht erst wieder, nachdem der Bestand über die Grenze gestiegen ist und später erneut darunter fällt.</div>
-    <div class="card"><h2>Aktuell nachbestellen</h2><table><tr><th>Status</th><th>Nr.</th><th>Artikel</th><th>Bestand</th><th>Min.</th><th>Soll</th><th>Vorschlag</th><th>E-Mail</th></tr>
-      {trs or '<tr><td colspan="8" class="ok">Aktuell keine Nachbestellung erforderlich.</td></tr>'}
-    </table></div>
-    <div class="card"><h2>Historie</h2><table><tr><th>Zeit</th><th>Artikel</th><th>Bestand</th><th>Min.</th><th>Vorschlag</th><th>Status</th><th>E-Mail</th></tr>{htrs}</table></div>
-    """
-    return page(html, "purchasing")
-
+    c=con(); period=request.args.get('period','30')
+    try: days=max(1,min(3650,int(period)))
+    except: days=30
+    since=(datetime.now()-timedelta(days=days)).isoformat(timespec='minutes')
+    moves=c.execute("""SELECT m.*,COALESCE(m.article_no,lc.article_no,'–') ano,COALESCE(NULLIF(m.quantity,0),lc.quantity,0) qty,COALESCE(lc.article_name,'') aname FROM movements m LEFT JOIN load_carriers lc ON lc.id=m.load_carrier_id WHERE m.created_at>=? ORDER BY m.created_at DESC""",(since,)).fetchall()
+    inbound=[x for x in moves if 'Einlagerung' in x['movement_type']]; outbound=[x for x in moves if 'Auslagerung' in x['movement_type']]
+    in_qty=sum(int(x['qty'] or 0) for x in inbound); out_qty=sum(int(x['qty'] or 0) for x in outbound)
+    by={}
+    for x in moves:
+        no=x['ano']; d=by.setdefault(no,{'name':x['aname'],'in':0,'out':0})
+        if 'Einlagerung' in x['movement_type']: d['in']+=int(x['qty'] or 0)
+        if 'Auslagerung' in x['movement_type']: d['out']+=int(x['qty'] or 0)
+    c.close(); trs=''.join(f"<tr><td>{no}</td><td>{d['name']}</td><td>{d['in']}</td><td>{d['out']}</td><td>{d['in']-d['out']}</td></tr>" for no,d in sorted(by.items())) or '<tr><td colspan="5">Keine Bewegungen im Zeitraum.</td></tr>'
+    return page(f"""<div class="kicker">BILANZ</div><h1 class="page-title">Einlagerung ↔ Auslagerung</h1><div class="card"><form><label>Zeitraum</label><select name="period"><option value="1">Heute / 1 Tag</option><option value="7">7 Tage</option><option value="30" {'selected' if days==30 else ''}>30 Tage</option><option value="365">365 Tage</option></select><button>Anzeigen</button></form></div><div class="metric-grid"><div class="metric"><span class="muted">Eingelagert</span><strong>{in_qty}</strong></div><div class="metric"><span class="muted">Ausgelagert</span><strong>{out_qty}</strong></div><div class="metric"><span class="muted">Differenz</span><strong>{in_qty-out_qty}</strong></div><div class="metric"><span class="muted">Bewegungen</span><strong>{len(moves)}</strong></div></div><div class="card"><table><tr><th>Artikel</th><th>Name</th><th>Eingelagert</th><th>Ausgelagert</th><th>Differenz</th></tr>{trs}</table></div>""",'more')
 
 @app.route("/manifest.webmanifest")
 def manifest():
@@ -1881,7 +1528,7 @@ def service_worker():
 @app.route("/api/health")
 def health():
     c=con(); c.execute("SELECT 1").fetchone(); c.close()
-    return {"ok":True,"database":True,"version":"V33"}
+    return {"ok":True,"database":True,"version":"V34"}
 
 
 
@@ -2364,7 +2011,6 @@ def manual_booking():
                         )
 
                         c.commit()
-                        evaluate_reorder(article["article_no"])
                         prefix="Neuer Artikel automatisch im Artikelstamm angelegt. " if created_new else "Artikelstamm automatisch aktualisiert. "
                         msg=prefix + f'{article["article_no"]} - {article["booking_article_name"]}: {cartons_on_pallet} Kartons auf {slot_code} gebucht.'
                         success=True
@@ -2536,19 +2182,21 @@ def audit(action, entity_type="", entity_id="", before=None, after=None, note=""
         pass
 
 def role_allowed(*roles):
-    # V35 Entwicklungsmodus: Rechtepruefung voruebergehend deaktiviert.
-    # Benutzerverwaltung bleibt fuer die spaetere Firmenversion im Code erhalten.
-    return True
+    return session.get('role') in roles
 
 @app.before_request
 def security_gate():
-    # V35 ENTWICKLUNGSMODUS: keine Anmeldung erforderlich.
-    # Virtueller Admin sorgt dafuer, dass alle Entwicklungsfunktionen sichtbar sind.
-    session.setdefault('user_id', 0)
-    session.setdefault('username', 'Entwicklung')
-    session.setdefault('role', 'Admin')
-    session['last_seen'] = now_iso()
-    return None
+    if request.endpoint in {'login','setup_admin','health','manifest','service_worker','static'}:
+        return
+    c=con(); count=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]; c.close()
+    if count==0: return redirect('/setup')
+    if not session.get('user_id'): return redirect('/login?next='+request.path)
+    last=session.get('last_seen')
+    if last:
+        try:
+            if datetime.now()-datetime.fromisoformat(last)>timedelta(hours=8): session.clear(); return redirect('/login')
+        except Exception: pass
+    session['last_seen']=now_iso()
 
 @app.route('/setup',methods=['GET','POST'])
 def setup_admin():
@@ -2579,8 +2227,7 @@ def login():
 
 @app.route('/logout')
 def logout():
-    # Im Entwicklungsmodus gibt es keine aktive Anmeldung.
-    return redirect('/')
+    audit('Logout','user',session.get('user_id')); session.clear(); return redirect('/login')
 
 @app.route('/users',methods=['GET','POST'])
 def users_page():
@@ -2591,44 +2238,23 @@ def users_page():
             u=request.form['username'].strip(); role=request.form.get('role','Mitarbeiter'); c.execute("INSERT INTO users(username,password_hash,full_name,role,created_at) VALUES(?,?,?,?,?)",(u,generate_password_hash(request.form['password']),request.form.get('full_name',u),role,now_iso())); c.commit(); audit('Benutzer angelegt','user',u,after={'role':role}); msg='Benutzer angelegt.'
         except Exception as e: msg=str(e)
     rows=c.execute("SELECT * FROM users ORDER BY username").fetchall(); c.close(); trs=''.join(f"<tr><td>{r['username']}</td><td>{r['full_name']}</td><td>{r['role']}</td><td>{'aktiv' if r['active'] else 'inaktiv'}</td></tr>" for r in rows)
-    return page(f'<div class="kicker">ADMIN · ZUGANGSVERWALTUNG</div><h1 class="page-title">Benutzer hinzufügen</h1><div class="notice">Entwicklungsmodus aktiv: Die Anmeldung ist vorübergehend deaktiviert. Die Benutzerverwaltung bleibt erhalten und kann später für die Firmenversion wieder aktiviert werden.</div><div class="card"><h2>Neuen Benutzer anlegen</h2><p>{msg}</p><form method="post"><div class="row"><input name="full_name" placeholder="Name" required><input name="username" placeholder="Benutzername" required></div><div class="row"><input type="password" name="password" minlength="8" placeholder="Startpasswort" required><select name="role"><option>Mitarbeiter</option><option>Lagerleitung</option><option>Admin</option></select></div><button>Benutzer hinzufügen</button></form></div><div class="card"><h2>Vorhandene Benutzer</h2><table><tr><th>Benutzer</th><th>Name</th><th>Rolle</th><th>Status</th></tr>{trs}</table></div>','users')
+    return page(f'<div class="kicker">ADMIN · ZUGANGSVERWALTUNG</div><h1 class="page-title">Benutzer hinzufügen</h1><div class="notice">Ohne Anmeldung sehen Benutzer ausschließlich die Login-Seite. Nach erfolgreicher Anmeldung erhalten sie Zugriff entsprechend ihrer Rolle. Nur Administratoren können diesen Bereich öffnen.</div><div class="card"><h2>Neuen Benutzer anlegen</h2><p>{msg}</p><form method="post"><div class="row"><input name="full_name" placeholder="Name" required><input name="username" placeholder="Benutzername" required></div><div class="row"><input type="password" name="password" minlength="8" placeholder="Startpasswort" required><select name="role"><option>Mitarbeiter</option><option>Lagerleitung</option><option>Admin</option></select></div><button>Benutzer hinzufügen</button></form></div><div class="card"><h2>Vorhandene Benutzer</h2><table><tr><th>Benutzer</th><th>Name</th><th>Rolle</th><th>Status</th></tr>{trs}</table></div>','users')
 
 @app.route('/more')
 def more_page():
-    links=[('/stock','Bestände'),('/purchasing','Einkauf / Nachbestellen'),('/reports','Ein-/Auslagerungsbilanz'),('/batch-booking','Mehrfach-Einlagerung'),('/reservations','Reservierungen'),('/optimizer','Optimierungsassistent'),('/simulation','Lager-Simulation'),('/handover','Schichtübergabe'),('/notifications','Frühwarnsystem')]
+    links=[('/stock','Bestände'),('/purchasing','Einkauf / Nachbestellen'),('/reports','Bilanz / Berichte'),('/batch-booking','Mehrfach-Einlagerung'),('/reservations','Reservierungen'),('/optimizer','Optimierungsassistent'),('/simulation','Lager-Simulation'),('/handover','Schichtübergabe'),('/notifications','Frühwarnsystem')]
     if role_allowed('Admin'):
         links += [('/audit','Audit-Historie'),('/backup','Backups'),('/settings','Einstellungen'),('/users','Benutzerverwaltung')]
+    links.append(('/logout','Abmelden'))
     cards=''.join(f'<a class="action-card" href="{u}"><b>{t}</b><span class="muted">Öffnen</span></a>' for u,t in links)
     return page(f'<div class="kicker">ERWEITERUNGEN</div><h1 class="page-title">LagerPro Complete</h1><div class="action-grid">{cards}</div>','more')
 
 @app.route('/stock')
 def stock_page():
-    q=request.args.get('q','').strip()
-    c=con()
-    sql="""SELECT a.article_no,COALESCE(a.article_name,a.name,a.article_no) article_name,
-                  COALESCE(a.min_stock,0) min_stock,COALESCE(a.target_stock,0) target_stock,
-                  COUNT(lc.id) pallets,COALESCE(SUM(lc.quantity),0) qty,
-                  GROUP_CONCAT(CASE WHEN lc.rack IS NOT NULL THEN lc.rack||'-'||lc.level||'-'||lc.position END) slots
-           FROM articles a
-           LEFT JOIN load_carriers lc ON lc.article_no=a.article_no AND lc.status!='ausgelagert' AND lc.rack IS NOT NULL
-           WHERE 1=1"""
-    args=[]
-    if q:
-        sql+=" AND (a.article_no LIKE ? OR COALESCE(a.article_name,a.name,'') LIKE ?)"
-        args=[f'%{q}%',f'%{q}%']
-    sql+=" GROUP BY a.article_no,a.article_name,a.name,a.min_stock,a.target_stock ORDER BY article_name"
-    rows=c.execute(sql,args).fetchall()
-    c.close()
-    # Bewertung außerhalb der offenen DB-Verbindung, damit E-Mail/Alert sicher arbeiten kann.
-    for r in rows:
-        evaluate_reorder(r['article_no'])
-    trs=''
-    for r in rows:
-        critical=(r['min_stock'] or 0)>0 and (r['qty'] or 0)<=r['min_stock']
-        cls='danger' if critical else 'ok'
-        status='NACHBESTELLEN' if critical else 'OK'
-        trs+=f"<tr><td>{r['article_no']}</td><td>{r['article_name']}</td><td>{r['pallets']}</td><td><b>{r['qty'] or 0}</b></td><td>{r['min_stock']}</td><td>{r['target_stock']}</td><td class='{cls}'><b>{status}</b></td><td>{r['slots'] or ''}</td></tr>"
-    return page(f'<div class="kicker">BESTAND</div><h1 class="page-title">Bestände & Nachbestellgrenzen</h1><div class="card"><form><input name="q" value="{q}" placeholder="Artikelnummer oder Name"><button>Suchen</button></form></div><div class="card"><table><tr><th>Nr.</th><th>Artikel</th><th>Paletten</th><th>Bestand</th><th>Minimum</th><th>Soll</th><th>Status</th><th>Plätze</th></tr>{trs}</table><p><a class="yellow-link" href="/purchasing">→ Nachbestellliste öffnen</a></p></div>','more')
+    q=request.args.get('q','').strip(); c=con(); sql="SELECT article_no,article_name,COUNT(*) pallets,SUM(quantity) qty,GROUP_CONCAT(rack||'-'||level||'-'||position) slots FROM load_carriers WHERE status!='ausgelagert' AND rack IS NOT NULL"; args=[]
+    if q: sql+=" AND (article_no LIKE ? OR article_name LIKE ?)"; args=[f'%{q}%',f'%{q}%']
+    sql+=" GROUP BY article_no,article_name ORDER BY article_name"; rows=c.execute(sql,args).fetchall(); c.close(); trs=''.join(f"<tr><td>{r['article_no']}</td><td>{r['article_name']}</td><td>{r['pallets']}</td><td>{r['qty'] or 0}</td><td>{r['slots'] or ''}</td></tr>" for r in rows)
+    return page(f'<div class="kicker">BESTAND</div><h1 class="page-title">Bestände & Teilpaletten</h1><div class="card"><form><input name="q" value="{q}" placeholder="Artikelnummer oder Name"><button>Suchen</button></form></div><div class="card"><table><tr><th>Nr.</th><th>Artikel</th><th>Paletten</th><th>Kartons</th><th>Plätze</th></tr>{trs}</table></div>','more')
 
 @app.route('/batch-booking',methods=['GET','POST'])
 def batch_booking():
@@ -2735,7 +2361,6 @@ def batch_booking():
                     skipped.append(f'{raw_code}: Buchungsfehler {type(exc).__name__}')
 
             c.commit()
-            evaluate_reorder(ano)
             audit('Mehrfach-Einlagerung','article',ano,after={'slots':booked,'skipped':len(skipped)})
             msg=f'{len(booked)} Paletten eingelagert.'
             if skipped:
@@ -2804,8 +2429,8 @@ def handover_page():
 
 @app.route('/notifications')
 def notifications_page():
-    c=con(); blocked=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE slot_status='gesperrt'").fetchone()[0]; quarantine=c.execute("SELECT COUNT(*) FROM load_carriers WHERE quality_status='quarantaene'").fetchone()[0]; delayed=c.execute("SELECT COUNT(*) FROM containers WHERE status='verspätet'").fetchone()[0]; tasks=c.execute("SELECT COUNT(*) FROM tasks WHERE status='offen'").fetchone()[0]; reorder=c.execute("SELECT COUNT(*) FROM reorder_alerts WHERE status='offen'").fetchone()[0]; total=c.execute("SELECT COUNT(*) FROM warehouse_slots").fetchone()[0]; occ=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE load_carrier_id IS NOT NULL").fetchone()[0]; c.close(); pct=round(100*occ/total) if total else 0
-    return page(f'<div class="kicker">FRÜHWARNSYSTEM</div><h1 class="page-title">Hinweise</h1><div class="notice danger">{blocked} gesperrte Plätze</div><div class="notice warn">{quarantine} Quarantäne-Träger</div><div class="notice warn">{delayed} verspätete Container</div><div class="notice danger"><b>{reorder} Artikel müssen nachbestellt werden</b> · <a class="yellow-link" href="/purchasing">Einkauf öffnen →</a></div><div class="notice">{tasks} offene Aufgaben</div><div class="notice">Lagerauslastung {pct}%</div>','more')
+    c=con(); blocked=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE slot_status='gesperrt'").fetchone()[0]; quarantine=c.execute("SELECT COUNT(*) FROM load_carriers WHERE quality_status='quarantaene'").fetchone()[0]; delayed=c.execute("SELECT COUNT(*) FROM containers WHERE status='verspätet'").fetchone()[0]; tasks=c.execute("SELECT COUNT(*) FROM tasks WHERE status='offen'").fetchone()[0]; total=c.execute("SELECT COUNT(*) FROM warehouse_slots").fetchone()[0]; occ=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE load_carrier_id IS NOT NULL").fetchone()[0]; c.close(); pct=round(100*occ/total) if total else 0
+    return page(f'<div class="kicker">FRÜHWARNSYSTEM</div><h1 class="page-title">Hinweise</h1><div class="notice danger">{blocked} gesperrte Plätze</div><div class="notice warn">{quarantine} Quarantäne-Träger</div><div class="notice warn">{delayed} verspätete Container</div><div class="notice">{tasks} offene Aufgaben</div><div class="notice">Lagerauslastung {pct}%</div>','more')
 
 @app.route('/audit')
 def audit_page():
@@ -2824,65 +2449,67 @@ def backup_page():
     rows=c.execute("SELECT * FROM backup_log ORDER BY id DESC LIMIT 20").fetchall(); c.close(); trs=''.join(f"<tr><td>{x['created_at']}</td><td>{x['filename']}</td><td>{x['status']}</td></tr>" for x in rows)
     return page(f'<div class="kicker">BACKUP</div><h1 class="page-title">Datensicherung</h1><div class="card"><p>{msg}</p><form method="post"><button>Backup jetzt erstellen</button></form></div><div class="card"><table>{trs}</table></div>','more')
 
+
+@app.route('/container/<int:cid>/finish',methods=['POST'])
+def finish_container(cid):
+    c=con(); cont=c.execute("SELECT * FROM containers WHERE id=?",(cid,)).fetchone()
+    if not cont: c.close(); return redirect('/containers')
+    finished=now_iso(); c.execute("UPDATE containers SET status='erledigt',unload_finished_at=? WHERE id=?",(finished,cid)); c.commit(); c.close()
+    who=session.get('username') or 'Unbekannt'; gate=cont['gate_no'] or '–'
+    send_system_email('container_fertig',f"Container fertig: {cont['container_no']} · Tor {gate}",f"Container {cont['container_no']} wurde fertig gebucht.\nTor: {gate}\nFertig am: {finished}\nGebucht von: {who}\n\nLagerPro")
+    audit('Container fertig','container',cid,after={'status':'erledigt','gate':gate})
+    return redirect(f'/container/{cid}')
+
+@app.route('/purchasing',methods=['GET','POST'])
+def purchasing_page():
+    c=con(); msg=''
+    if request.method=='POST':
+        no=request.form.get('article_no','').strip()
+        try: mn=max(0,int(request.form.get('min_stock') or 0)); target=max(mn,int(request.form.get('target_stock') or mn))
+        except: mn=target=0
+        c.execute("UPDATE articles SET min_stock=?,target_stock=? WHERE article_no=?",(mn,target,no)); c.commit(); msg='Bestandsgrenzen gespeichert.'
+    rows=c.execute("SELECT article_no,COALESCE(article_name,name,article_no) n,min_stock,target_stock FROM articles ORDER BY n").fetchall()
+    data=[]
+    for a in rows:
+        stock=article_stock(c,a['article_no']); target=max(int(a['target_stock'] or 0),int(a['min_stock'] or 0)); data.append((a,stock,max(0,target-stock)))
+    c.close(); check_reorders()
+    trs=''.join(f"<tr><td>{a['article_no']}</td><td>{a['n']}</td><td><b>{stock}</b></td><td>{a['min_stock']}</td><td>{a['target_stock']}</td><td>{suggested}</td><td><span class='pill {'red' if a['min_stock'] and stock<=a['min_stock'] else 'green'}'>{'NACHBESTELLEN' if a['min_stock'] and stock<=a['min_stock'] else 'OK'}</span></td><td><form method='post'><input type='hidden' name='article_no' value='{a['article_no']}'><input style='width:80px' type='number' min='0' name='min_stock' value='{a['min_stock']}'><input style='width:80px' type='number' min='0' name='target_stock' value='{a['target_stock']}'><button class='small-btn'>Speichern</button></form></td></tr>" for a,stock,suggested in data)
+    return page(f"""<div class="kicker">EINKAUF</div><h1 class="page-title">Nachbestellungen</h1><div class="notice">Sobald der Bestand den Mindestbestand erreicht oder unterschreitet, wird einmalig eine E-Mail ausgelöst. Erst wenn der Bestand wieder darüber liegt und später erneut fällt, entsteht eine neue Meldung.</div><div class="card"><p class="ok">{msg}</p><table><tr><th>Nr.</th><th>Artikel</th><th>Bestand</th><th>Minimum</th><th>Soll</th><th>Vorschlag</th><th>Status</th><th>Grenzen ändern</th></tr>{trs}</table></div>""",'more')
+
+@app.route('/settings/test-email',methods=['POST'])
+def test_email():
+    if not role_allowed('Admin'): return page('<div class="card">Nur Admin.</div>','more'),403
+    ok=send_system_email('test', 'LagerPro Test-Mail', 'Die SMTP-Konfiguration von LagerPro funktioniert.\n\nZeitpunkt: '+now_iso())
+    c=con(); row=c.execute("SELECT * FROM email_log WHERE event_type='test' ORDER BY id DESC LIMIT 1").fetchone(); c.close()
+    if ok: msg='<div class="notice ok"><b>Test-Mail wurde versendet.</b></div>'
+    else: msg='<div class="notice danger"><b>Test-Mail fehlgeschlagen.</b><br>'+((row['error_text'] if row else None) or 'Unbekannter SMTP-Fehler')+'</div>'
+    return page('<div class="kicker">E-MAIL TEST</div><h1 class="page-title">SMTP-Diagnose</h1>'+msg+'<p><a class="small-btn" href="/settings">Zurück zu Einstellungen</a></p>','more')
+
+@app.route('/email-log')
+def email_log_page():
+    if not role_allowed('Admin','Lagerleitung'): return page('<div class="card">Keine Berechtigung.</div>','more'),403
+    c=con(); rows=c.execute("SELECT * FROM email_log ORDER BY id DESC LIMIT 200").fetchall(); c.close()
+    trs=''.join(f"<tr><td>{x['created_at']}</td><td>{x['event_type']}</td><td>{x['recipient'] or '–'}</td><td>{x['subject']}</td><td>{x['status']}</td><td>{x['error_text'] or '–'}</td></tr>" for x in rows)
+    return page(f'<div class="kicker">E-MAIL</div><h1 class="page-title">Versandprotokoll</h1><div class="card"><table><tr><th>Zeit</th><th>Ereignis</th><th>Empfänger</th><th>Betreff</th><th>Status</th><th>Fehler</th></tr>{trs}</table></div>','more')
+
 @app.route('/settings',methods=['GET','POST'])
 def settings_page():
-    if not role_allowed('Admin'):
-        return page('<div class="card">Nur Admin.</div>','more'),403
-    defaults={
-        'company_name':'LagerPro','auto_logout':'8','four_eyes_threshold':'10',
-        'email_enabled':'0','supervisor_emails':'','purchasing_emails':'',
-        'smtp_host':'','smtp_port':'587','smtp_user':'','smtp_password':'',
-        'email_from':'','smtp_security':'starttls'
-    }
-    msg=''
+    if not role_allowed('Admin'): return page('<div class="card">Nur Admin.</div>','more'),403
+    c=con(); defaults={'company_name':'LagerPro','auto_logout':'8','four_eyes_threshold':'10','notification_emails':'','smtp_host':'','smtp_port':'587','smtp_user':'','smtp_password':'','smtp_sender':'','smtp_starttls':'1','smtp_ssl':'0'}
     if request.method=='POST':
-        action=request.form.get('action','save')
-        if action=='save':
-            c=con()
-            for k,default in defaults.items():
-                if k=='email_enabled':
-                    val='1' if request.form.get('email_enabled')=='1' else '0'
-                else:
-                    val=request.form.get(k,default)
-                if k=='smtp_password' and not val:
-                    old=c.execute("SELECT setting_value FROM app_settings WHERE setting_key='smtp_password'").fetchone()
-                    val=old['setting_value'] if old else ''
-                c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES(?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",(k,val,now_iso()))
-            c.commit(); c.close()
-            audit('Einstellungen geändert','system')
-            msg='Einstellungen gespeichert.'
-        elif action=='test_supervisor':
-            ok,info=send_system_email('testmail','system','supervisor',setting_value('supervisor_emails',''),'LagerPro Testmail – Vorgesetzter','Die automatische E-Mail für fertig gemeldete Container ist eingerichtet.')
-            msg='Testmail gesendet.' if ok else 'Testmail nicht gesendet: '+str(info)
-        elif action=='test_purchasing':
-            ok,info=send_system_email('testmail','system','purchasing',setting_value('purchasing_emails',''),'LagerPro Testmail – Einkauf','Die automatische E-Mail für Nachbestellungen ist eingerichtet.')
-            msg='Testmail gesendet.' if ok else 'Testmail nicht gesendet: '+str(info)
-
-    c=con()
-    vals=defaults.copy()
-    vals.update({x['setting_key']:x['setting_value'] for x in c.execute("SELECT * FROM app_settings")})
-    logs=c.execute("SELECT * FROM notification_log ORDER BY id DESC LIMIT 25").fetchall()
-    c.close()
-    sec=vals['smtp_security']
-    logtrs=''.join(f'<tr><td>{x["created_at"]}</td><td>{x["event_type"]}</td><td>{x["recipient"] or "–"}</td><td>{x["status"]}</td><td>{x["error_text"] or "–"}</td></tr>' for x in logs) or '<tr><td colspan="5" class="muted">Noch keine E-Mail-Vorgänge.</td></tr>'
-    html=f'''<div class="kicker">ADMIN</div><h1 class="page-title">Einstellungen</h1>
-    <div class="notice">{msg or 'Hier richtest du die automatischen E-Mails für fertige Container und Nachbestellungen ein.'}</div>
-    <div class="card"><form method="post"><input type="hidden" name="action" value="save">
-      <label>Systemname</label><input name="company_name" value="{vals['company_name']}">
-      <div class="row"><div>Auto-Logout Stunden<input type="number" name="auto_logout" value="{vals['auto_logout']}"></div><div>Vier-Augen-Schwelle<input type="number" name="four_eyes_threshold" value="{vals['four_eyes_threshold']}"></div></div>
-      <h2>E-Mail-Automatik</h2>
-      <label><input type="checkbox" name="email_enabled" value="1" {'checked' if vals['email_enabled']=='1' else ''}> Automatische E-Mails aktivieren</label>
-      <div class="row"><div>Vorgesetzter – Container fertig<input name="supervisor_emails" value="{vals['supervisor_emails']}" placeholder="chef@firma.de, leitung@firma.de"><span class="muted">Mehrere Adressen mit Komma oder Semikolon trennen.</span></div><div>Einkauf – Nachbestellung<input name="purchasing_emails" value="{vals['purchasing_emails']}" placeholder="einkauf@firma.de"></div></div>
-      <h2>SMTP-Mailserver</h2>
-      <div class="row"><div>SMTP Host<input name="smtp_host" value="{vals['smtp_host']}" placeholder="smtp.office365.com"></div><div>Port<input type="number" name="smtp_port" value="{vals['smtp_port']}"></div></div>
-      <div class="row"><div>SMTP Benutzer<input name="smtp_user" value="{vals['smtp_user']}" placeholder="lager@firma.de"></div><div>Absender<input name="email_from" value="{vals['email_from']}" placeholder="lager@firma.de"></div></div>
-      <label>SMTP Passwort / App-Passwort</label><input type="password" name="smtp_password" value="" placeholder="leer lassen = vorhandenes Passwort behalten">
-      <label>Verbindungssicherheit</label><select name="smtp_security"><option value="starttls" {'selected' if sec=='starttls' else ''}>STARTTLS (meist Port 587)</option><option value="ssl" {'selected' if sec=='ssl' else ''}>SSL/TLS (meist Port 465)</option><option value="none" {'selected' if sec=='none' else ''}>Keine TLS-Verschlüsselung</option></select>
-      <button>Speichern</button>
-    </form></div>
-    <div class="two"><div class="card"><form method="post"><input type="hidden" name="action" value="test_supervisor"><button>Testmail an Vorgesetzten</button></form></div><div class="card"><form method="post"><input type="hidden" name="action" value="test_purchasing"><button>Testmail an Einkauf</button></form></div></div>
-    <div class="card"><h2>Letzte E-Mail-Vorgänge</h2><table><tr><th>Zeit</th><th>Typ</th><th>Empfänger</th><th>Status</th><th>Fehler</th></tr>{logtrs}</table></div>'''
-    return page(html,'settings')
+        for k in defaults:
+            val=request.form.get(k,defaults[k])
+            c.execute("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES(?,?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value,updated_at=excluded.updated_at",(k,val,now_iso()))
+        c.commit(); audit('Einstellungen geändert','system')
+    vals=defaults.copy(); vals.update({x['setting_key']:x['setting_value'] for x in c.execute("SELECT * FROM app_settings")}); c.close()
+    checked_tls='checked' if vals['smtp_starttls']=='1' else ''; checked_ssl='checked' if vals['smtp_ssl']=='1' else ''
+    return page(f"""<div class="kicker">ADMIN</div><h1 class="page-title">Einstellungen & E-Mail</h1>
+    <div class="card"><form method="post"><label>Systemname</label><input name="company_name" value="{vals['company_name']}"><label>Auto-Logout Stunden</label><input type="number" name="auto_logout" value="{vals['auto_logout']}"><label>Vier-Augen-Schwelle</label><input type="number" name="four_eyes_threshold" value="{vals['four_eyes_threshold']}">
+    <h2>E-Mail-Benachrichtigungen</h2><label>Empfänger (Vorgesetzter / Einkauf; mehrere mit Komma)</label><input name="notification_emails" value="{vals['notification_emails']}" placeholder="vorgesetzter@firma.de, einkauf@firma.de">
+    <div class="row"><div><label>SMTP-Server</label><input name="smtp_host" value="{vals['smtp_host']}" placeholder="smtp.office365.com"></div><div><label>Port</label><input type="number" name="smtp_port" value="{vals['smtp_port']}"></div></div>
+    <div class="row"><div><label>SMTP-Benutzer</label><input name="smtp_user" value="{vals['smtp_user']}"></div><div><label>Absender</label><input name="smtp_sender" value="{vals['smtp_sender']}"></div></div>
+    <label>SMTP-Passwort / App-Passwort</label><input type="password" name="smtp_password" value="{vals['smtp_password']}">
+    <label><input type="checkbox" name="smtp_starttls" value="1" {checked_tls}> STARTTLS verwenden</label><label><input type="checkbox" name="smtp_ssl" value="1" {checked_ssl}> Direktes SSL verwenden</label><button>Speichern</button></form></div>""",'more')
 
 # ================= ENDE V30 MODULES =================
 
