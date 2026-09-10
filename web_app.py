@@ -1854,7 +1854,7 @@ def manual_booking():
                         now=datetime.now().isoformat(timespec="minutes")
 
                         # quantity = Kartons auf dieser Palette / diesem Lagerplatz
-                        c.execute(
+                        cur=c.execute(
                             "INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,closed_at,stored_at,quality_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (
                                 carrier_no,
@@ -1866,7 +1866,7 @@ def manual_booking():
                                 r,l,p,now,now,now,"frei"
                             )
                         )
-                        lid=c.lastrowid
+                        lid=cur.lastrowid
 
                         c.execute(
                             "UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?,slot_status='belegt' WHERE rack=? AND level=? AND position=?",
