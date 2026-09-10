@@ -70,6 +70,62 @@ def init_db():
                     (rack, level, position)
                 )
 
+    # V17: real warehouse flow: cartons -> pieces -> load carrier -> serials -> storage slot
+    def add_col(table, definition):
+        name = definition.split()[0]
+        cols = {r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+        if name not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    add_col("articles", "units_per_carton INTEGER NOT NULL DEFAULT 1")
+    add_col("items", "units_per_carton INTEGER NOT NULL DEFAULT 1")
+    add_col("items", "article_count INTEGER NOT NULL DEFAULT 0")
+    add_col("warehouse_slots", "load_carrier_no TEXT")
+    add_col("warehouse_slots", "load_carrier_id INTEGER")
+
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS load_carriers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        carrier_no TEXT NOT NULL UNIQUE,
+        container_id INTEGER,
+        article_no TEXT,
+        article_name TEXT,
+        quantity INTEGER NOT NULL DEFAULT 0,
+        pallet_type TEXT,
+        status TEXT NOT NULL DEFAULT 'offen',
+        rack INTEGER,
+        level INTEGER,
+        position INTEGER,
+        created_at TEXT NOT NULL,
+        closed_at TEXT,
+        stored_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS serial_numbers(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        load_carrier_id INTEGER NOT NULL,
+        serial_no TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS movements(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        load_carrier_id INTEGER,
+        carrier_no TEXT,
+        movement_type TEXT NOT NULL,
+        from_slot TEXT,
+        to_slot TEXT,
+        created_at TEXT NOT NULL
+    );
+    """)
+
+    # Backfill article_count for old container positions if present.
+    c.execute("""
+        UPDATE items
+        SET article_count = cartons * COALESCE(NULLIF(units_per_carton,0),1)
+        WHERE COALESCE(article_count,0)=0
+    """)
+
     c.commit()
     c.close()
 
@@ -249,6 +305,27 @@ th{color:#aebed3}
 .slot .slot-state{font-size:10px;font-weight:900;letter-spacing:.5px}
 .slot.free .slot-state{color:#7f94af}
 .slot.occupied .slot-state{color:var(--green)}
+
+.scanbox{
+  border:1px solid #36577c;background:#091827;border-radius:16px;padding:14px;margin:12px 0
+}
+.scan-input{
+  font-size:20px!important;font-weight:800;letter-spacing:.4px;
+  min-height:52px!important;border:2px solid #36577c!important
+}
+.progress{
+  height:12px;background:#07111f;border:1px solid #294766;border-radius:999px;overflow:hidden;margin:8px 0
+}
+.progress > span{display:block;height:100%;background:var(--yellow);border-radius:999px}
+.action-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.action-card{
+  display:block;text-decoration:none;color:white;background:#0d1b2d;border:1px solid #203a5b;
+  border-radius:16px;padding:16px
+}
+.action-card b{display:block;font-size:18px;margin-bottom:5px}
+.ok{color:var(--green)} .warn{color:var(--yellow)} .danger{color:var(--red)}
+@media(max-width:760px){.action-grid{grid-template-columns:1fr}.scan-input{font-size:18px!important}}
+
 @media(max-width:760px){
   .slot-grid{grid-template-columns:repeat(6,minmax(74px,1fr))}
   .warehouse-toolbar{grid-template-columns:1fr 1fr}
@@ -280,8 +357,10 @@ def bottom_nav(active):
         ("/","⌂","Dashboard","dashboard"),
         ("/articles","◈","Artikel","articles"),
         ("/containers","▣","Container","containers"),
+        ("/carriers","▤","Träger","carriers"),
         ("/warehouse","▦","Lager","warehouse"),
         ("/gates","▥","Tore","gates"),
+        ("/archive","◷","Archiv","archive"),
     ]
     html = '<div class="bottom-nav">'
     for url, icon, text, key in pages:
@@ -324,7 +403,7 @@ def dashboard():
     ).fetchall()
     total_places = c.execute("SELECT COUNT(*) FROM warehouse_slots").fetchone()[0]
     occupied = c.execute(
-        "SELECT COUNT(*) FROM warehouse_slots WHERE article_no IS NOT NULL"
+        "SELECT COUNT(*) FROM warehouse_slots WHERE load_carrier_id IS NOT NULL"
     ).fetchone()[0]
     c.close()
 
@@ -456,476 +535,424 @@ def dashboard():
     html += "</table></div></section>"
     return page(html, "dashboard")
 
+
 @app.route("/articles", methods=["GET", "POST"])
 def articles():
     c = con()
     if request.method == "POST":
+        units = max(1, int(request.form.get("units_per_carton", 1)))
         c.execute("""
-        INSERT INTO articles(article_no,name,pallet_type,cpp,storage_rule)
-        VALUES(?,?,?,?,?)
+        INSERT INTO articles(article_no,name,pallet_type,cpp,storage_rule,units_per_carton)
+        VALUES(?,?,?,?,?,?)
         ON CONFLICT(article_no) DO UPDATE SET
-        name=excluded.name,
-        pallet_type=excluded.pallet_type,
-        cpp=excluded.cpp,
-        storage_rule=excluded.storage_rule
+          name=excluded.name,
+          pallet_type=excluded.pallet_type,
+          storage_rule=excluded.storage_rule,
+          units_per_carton=excluded.units_per_carton
         """, (
             request.form["no"].strip(),
             request.form["name"].strip(),
             request.form["ptype"],
-            max(1, int(request.form["cpp"])),
-            request.form["rule"]
+            1,
+            request.form["rule"],
+            units
         ))
-        c.commit()
-        c.close()
+        c.commit(); c.close()
         return redirect("/articles")
 
     rows = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
     c.close()
-
     html = """
     <div class="kicker">ARTIKELSTAMM</div>
     <h1 class="page-title">Artikel verwalten</h1>
-
     <div class="card">
       <form method="post">
         <div class="row">
           <div>Artikelnummer<input name="no" required></div>
           <div>Artikelname<input name="name" required></div>
         </div>
-
         <div class="row">
-          <div>Kartons pro Vollpalette<input type="number" min="1" name="cpp" required></div>
-          <div>
-            Palettentyp
-            <select name="ptype">
-              <option>Euro</option>
-              <option>Einweg</option>
-              <option>Einweg 115 x 115</option>
-            </select>
-          </div>
+          <div>Artikel pro Karton<input type="number" min="1" name="units_per_carton" required></div>
+          <div>Palettentyp<select name="ptype">
+            <option>Euro</option><option>Einweg</option><option>Einweg 115 x 115</option>
+          </select></div>
         </div>
-
         Lageregel
         <select name="rule">
-          <option>Alle Ebenen</option>
-          <option>Nur Ebene 1</option>
-          <option>Nur Ebene 2-4</option>
+          <option>Alle Ebenen</option><option>Nur Ebene 1</option><option>Nur Ebene 2-4</option>
         </select>
-
         <button>Artikel speichern</button>
       </form>
     </div>
-
-    <div class="card">
-      <table>
-        <tr><th>Nr.</th><th>Name</th><th>Kartons/Palette</th><th>Palette</th><th>Regel</th></tr>
+    <div class="card"><table>
+      <tr><th>Nr.</th><th>Name</th><th>Artikel/Karton</th><th>Palette</th><th>Regel</th></tr>
     """
-
-    for item in rows:
-        html += f"""
-        <tr>
-          <td>{item["article_no"]}</td>
-          <td>{item["name"]}</td>
-          <td>{item["cpp"]}</td>
-          <td>{item["pallet_type"]}</td>
-          <td>{item["storage_rule"]}</td>
-        </tr>
-        """
-
+    for x in rows:
+        html += f"""<tr><td>{x["article_no"]}</td><td>{x["name"]}</td>
+        <td><b>{x["units_per_carton"]}</b></td><td>{x["pallet_type"]}</td><td>{x["storage_rule"]}</td></tr>"""
     html += "</table></div>"
     return page(html, "articles")
+
 
 @app.route("/containers", methods=["GET", "POST"])
 def containers():
     c = con()
     if request.method == "POST":
-        gate = int(request.form["gate"]) if request.form["gate"] else None
-        c.execute("""
-        INSERT INTO containers(container_no,gate_no,status,created_at)
-        VALUES(?,?,?,?)
-        """, (
-            request.form["no"].strip(),
-            gate,
-            request.form["status"],
-            datetime.now().isoformat(timespec="minutes")
-        ))
-        c.commit()
-        c.close()
+        gate = int(request.form["gate"]) if request.form.get("gate") else None
+        c.execute("""INSERT INTO containers(container_no,gate_no,status,created_at)
+                     VALUES(?,?,?,?)""",
+                  (request.form["no"].strip(), gate, request.form["status"],
+                   datetime.now().isoformat(timespec="minutes")))
+        c.commit(); c.close()
         return redirect("/containers")
 
     rows = c.execute("SELECT * FROM containers ORDER BY id DESC").fetchall()
     c.close()
-
-    gate_options = "".join(f"<option>{x}</option>" for x in range(8, 13))
-
+    gates = "".join(f"<option>{x}</option>" for x in range(8,13))
     html = f"""
-    <div class="kicker">CONTAINER</div>
-    <h1 class="page-title">Containerverwaltung</h1>
-
-    <div class="card">
-      <form method="post">
-        Containernummer
-        <input name="no" required>
-
-        <div class="row">
-          <div>
-            Tor
-            <select name="gate">
-              <option value="">Kein Tor</option>
-              {gate_options}
-            </select>
-          </div>
-
-          <div>
-            Status
-            <select name="status">
-              <option>geplant</option>
-              <option>vor Ort</option>
-              <option>verspätet</option>
-              <option>bereit</option>
-              <option>erledigt</option>
-            </select>
-          </div>
-        </div>
-
-        <button>Container anlegen</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <table>
-        <tr><th>Container</th><th>Tor</th><th>Status</th></tr>
+    <div class="kicker">WARENEINGANG</div><h1 class="page-title">Container</h1>
+    <div class="card"><form method="post">
+      Containernummer<input name="no" required>
+      <div class="row"><div>Tor<select name="gate"><option value="">Kein Tor</option>{gates}</select></div>
+      <div>Status<select name="status">
+        <option>geplant</option><option>vor Ort</option><option>verspätet</option>
+        <option>Entladung</option><option>bereit</option><option>erledigt</option>
+      </select></div></div>
+      <button>Container anlegen</button>
+    </form></div>
+    <div class="card"><table><tr><th>Container</th><th>Tor</th><th>Status</th></tr>
     """
-
-    for item in rows:
-        html += f"""
-        <tr>
-          <td><a style="color:white" href="/container/{item["id"]}">{item["container_no"]}</a></td>
-          <td>{item["gate_no"] or "–"}</td>
-          <td><span class="badge">{item["status"]}</span></td>
-        </tr>
-        """
-
+    for x in rows:
+        html += f"""<tr><td><a style="color:white" href="/container/{x["id"]}">{x["container_no"]}</a></td>
+        <td>{x["gate_no"] or "–"}</td><td><span class="badge">{x["status"]}</span></td></tr>"""
     html += "</table></div>"
     return page(html, "containers")
+
 
 @app.route("/container/<int:cid>", methods=["GET", "POST"])
 def container_detail(cid):
     c = con()
-    container = c.execute("SELECT * FROM containers WHERE id=?", (cid,)).fetchone()
-
-    if not container:
-        c.close()
-        return redirect("/containers")
+    cont = c.execute("SELECT * FROM containers WHERE id=?", (cid,)).fetchone()
+    if not cont:
+        c.close(); return redirect("/containers")
 
     if request.method == "POST":
-        article = c.execute(
-            "SELECT * FROM articles WHERE article_no=?",
-            (request.form["article"],)
-        ).fetchone()
-
-        if article:
-            c.execute("""
-            INSERT INTO items(container_id,article_no,name,cartons,cpp,pallet_type)
-            VALUES(?,?,?,?,?,?)
-            """, (
-                cid,
-                article["article_no"],
-                article["name"],
-                int(request.form["cartons"]),
-                article["cpp"],
-                article["pallet_type"]
-            ))
+        art = c.execute("SELECT * FROM articles WHERE article_no=?",
+                        (request.form["article"],)).fetchone()
+        if art:
+            cartons = max(1, int(request.form["cartons"]))
+            upc = max(1, int(art["units_per_carton"]))
+            count = cartons * upc
+            c.execute("""INSERT INTO items
+                (container_id,article_no,name,cartons,cpp,pallet_type,units_per_carton,article_count)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                (cid,art["article_no"],art["name"],cartons,1,art["pallet_type"],upc,count))
             c.commit()
+        c.close(); return redirect(f"/container/{cid}")
 
-        c.close()
-        return redirect(f"/container/{cid}")
-
-    articles = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
-    items = c.execute("SELECT * FROM items WHERE container_id=?", (cid,)).fetchall()
+    arts = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
+    items = c.execute("SELECT * FROM items WHERE container_id=? ORDER BY id DESC",(cid,)).fetchall()
+    carriers = c.execute("SELECT * FROM load_carriers WHERE container_id=? ORDER BY id DESC",(cid,)).fetchall()
     c.close()
 
     html = f"""
-    <div class="kicker">CONTAINERDETAIL</div>
-    <h1 class="page-title">{container["container_no"]}</h1>
-
-    <div class="card">
-      <b>Tor {container["gate_no"] or "–"}</b>
-      &nbsp;
-      <span class="badge">{container["status"]}</span>
-    </div>
-
-    <div class="card">
-      <h2>Kartons hinzufügen</h2>
+    <div class="kicker">CONTAINERDETAIL</div><h1 class="page-title">{cont["container_no"]}</h1>
+    <div class="card"><b>Tor {cont["gate_no"] or "–"}</b> &nbsp; <span class="badge">{cont["status"]}</span></div>
+    <div class="card"><h2>Ware erfassen</h2>
+    <p class="muted">Kartonanzahl wird nur im Wareneingang erfasst. Der Bestand wird als Artikelanzahl geführt.</p>
     """
-
-    if articles:
+    if arts:
         html += '<form method="post">Artikel<select name="article">'
-        for article in articles:
-            html += (
-                f'<option value="{article["article_no"]}">'
-                f'{article["article_no"]} – {article["name"]} '
-                f'({article["cpp"]}/Palette)</option>'
-            )
-        html += """
-        </select>
-        Kartonanzahl
-        <input type="number" min="1" name="cartons" required>
-        <button>Hinzufügen</button>
-        </form>
-        """
+        for a in arts:
+            html += f'<option value="{a["article_no"]}">{a["article_no"]} – {a["name"]} · {a["units_per_carton"]} Artikel/Karton</option>'
+        html += '</select>Kartonanzahl<input type="number" min="1" name="cartons" required><button>Ware übernehmen</button></form>'
     else:
         html += '<p class="muted">Bitte zuerst einen Artikel anlegen.</p>'
-
-    html += """
-    </div>
-
-    <div class="card">
-      <h2>Containerinhalt</h2>
-      <table>
-        <tr><th>Artikel</th><th>Kartons</th><th>Voll</th><th>Rest</th><th>Plätze</th></tr>
-    """
-
-    total = 0
-
-    for item in items:
-        full, rest, places = calc(item["cartons"], item["cpp"])
-        total += places
-
-        html += f"""
-        <tr>
-          <td>{item["article_no"]}<br><span class="muted">{item["name"]}</span></td>
-          <td>{item["cartons"]}</td>
-          <td>{full}</td>
-          <td>{rest}</td>
-          <td><b>{places}</b></td>
-        </tr>
-        """
-
-    html += f"</table><h3>Benötigte Stellplätze: {total}</h3></div>"
+    html += """</div><div class="card"><h2>Containerinhalt</h2>
+      <table><tr><th>Artikel</th><th>Kartons</th><th>Artikel/Karton</th><th>Artikelanzahl</th></tr>"""
+    total_units = 0
+    for x in items:
+        total_units += x["article_count"]
+        html += f"""<tr><td>{x["article_no"]}<br><span class="muted">{x["name"]}</span></td>
+        <td>{x["cartons"]}</td><td>{x["units_per_carton"]}</td><td><b>{x["article_count"]}</b></td></tr>"""
+    html += f"</table><h3>Gesamte Artikelanzahl: {total_units}</h3></div>"
+    html += f"""<div class="card"><div class="section-head"><h2>Ladungsträger</h2>
+      <a class="yellow-link" href="/carriers/new?container_id={cid}">+ Ladungsträger scannen →</a></div>"""
+    if carriers:
+        html += "<table><tr><th>Träger</th><th>Artikel</th><th>Menge</th><th>Status</th></tr>"
+        for lt in carriers:
+            html += f"""<tr><td><a style="color:white" href="/carrier/{lt["id"]}">{lt["carrier_no"]}</a></td>
+            <td>{lt["article_no"] or "–"}</td><td>{lt["quantity"]}</td><td>{lt["status"]}</td></tr>"""
+        html += "</table>"
+    else:
+        html += '<p class="muted">Noch kein Ladungsträger für diesen Container.</p>'
+    html += "</div>"
     return page(html, "containers")
+
+
+@app.route("/carriers")
+def carriers():
+    c=con()
+    rows=c.execute("""SELECT lc.*, c.container_no FROM load_carriers lc
+                      LEFT JOIN containers c ON c.id=lc.container_id ORDER BY lc.id DESC""").fetchall()
+    c.close()
+    html="""<div class="kicker">LADUNGSTRÄGER</div><h1 class="page-title">Ladungsträger</h1>
+    <div class="action-grid">
+      <a class="action-card" href="/carriers/new"><b>＋ Träger erfassen</b><span class="muted">Nummer scannen und Ware aufnehmen</span></a>
+      <a class="action-card" href="/store"><b>⌁ Einlagern</b><span class="muted">Träger + Lagerplatz scannen</span></a>
+      <a class="action-card" href="/search"><b>⌕ Suchen</b><span class="muted">Träger, Artikel oder Seriennummer finden</span></a>
+    </div><div class="card"><table><tr><th>Träger</th><th>Artikel</th><th>Menge</th><th>Platz</th><th>Status</th></tr>"""
+    for x in rows:
+        slot = f'{x["rack"]}/{x["level"]}/{x["position"]}' if x["rack"] else "–"
+        html += f"""<tr><td><a style="color:white" href="/carrier/{x["id"]}">{x["carrier_no"]}</a></td>
+        <td>{x["article_no"] or "–"}</td><td>{x["quantity"]}</td><td>{slot}</td><td>{x["status"]}</td></tr>"""
+    html += "</table></div>"
+    return page(html,"carriers")
+
+
+@app.route("/carriers/new", methods=["GET","POST"])
+def carrier_new():
+    c=con()
+    if request.method=="POST":
+        no=request.form["carrier_no"].strip()
+        cid=int(request.form["container_id"]) if request.form.get("container_id") else None
+        if no:
+            try:
+                c.execute("""INSERT INTO load_carriers(carrier_no,container_id,status,created_at)
+                             VALUES(?,?,?,?)""",(no,cid,"offen",datetime.now().isoformat(timespec="minutes")))
+                c.commit()
+                new_id=c.execute("SELECT id FROM load_carriers WHERE carrier_no=?",(no,)).fetchone()["id"]
+                c.execute("""INSERT INTO movements(load_carrier_id,carrier_no,movement_type,created_at)
+                             VALUES(?,?,?,?)""",(new_id,no,"Ladungsträger erstellt",datetime.now().isoformat(timespec="minutes")))
+                c.commit(); c.close()
+                return redirect(f"/carrier/{new_id}")
+            except sqlite3.IntegrityError:
+                existing=c.execute("SELECT id FROM load_carriers WHERE carrier_no=?",(no,)).fetchone()
+                c.close()
+                return redirect(f'/carrier/{existing["id"]}')
+    containers=c.execute("SELECT * FROM containers WHERE status!='erledigt' ORDER BY id DESC").fetchall()
+    c.close()
+    selected=request.args.get("container_id","")
+    opts='<option value="">Ohne Container</option>'
+    for x in containers:
+        sel="selected" if str(x["id"])==selected else ""
+        opts += f'<option value="{x["id"]}" {sel}>{x["container_no"]}</option>'
+    html=f"""<div class="kicker">SCAN 1/3</div><h1 class="page-title">Ladungsträger erfassen</h1>
+    <div class="scanbox"><form method="post">
+      Ladungsträgernummer scannen
+      <input class="scan-input" name="carrier_no" autofocus autocomplete="off" required placeholder="LT scannen …">
+      Herkunftscontainer<select name="container_id">{opts}</select>
+      <button>Ladungsträger öffnen</button>
+    </form></div></div>"""
+    return page(html,"carriers")
+
+
+@app.route("/carrier/<int:lid>", methods=["GET","POST"])
+def carrier_detail(lid):
+    c=con()
+    lt=c.execute("SELECT * FROM load_carriers WHERE id=?",(lid,)).fetchone()
+    if not lt:
+        c.close(); return redirect("/carriers")
+    message=""
+    if request.method=="POST":
+        action=request.form.get("action")
+        if action=="article":
+            art=c.execute("SELECT * FROM articles WHERE article_no=?",(request.form["article_no"],)).fetchone()
+            if art:
+                qty=max(1,int(request.form.get("quantity",1)))
+                c.execute("""UPDATE load_carriers SET article_no=?,article_name=?,quantity=?,pallet_type=?
+                             WHERE id=?""",(art["article_no"],art["name"],qty,art["pallet_type"],lid))
+                c.commit()
+        elif action=="serial":
+            serial=request.form.get("serial_no","").strip()
+            if serial:
+                try:
+                    c.execute("""INSERT INTO serial_numbers(load_carrier_id,serial_no,created_at)
+                                 VALUES(?,?,?)""",(lid,serial,datetime.now().isoformat(timespec="minutes")))
+                    c.commit()
+                except sqlite3.IntegrityError:
+                    message="Seriennummer ist bereits im System."
+        elif action=="close":
+            c.execute("UPDATE load_carriers SET status='bereit',closed_at=? WHERE id=?",
+                      (datetime.now().isoformat(timespec="minutes"),lid)); c.commit()
+        c.close(); return redirect(f"/carrier/{lid}")
+
+    arts=c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
+    serials=c.execute("SELECT * FROM serial_numbers WHERE load_carrier_id=? ORDER BY id DESC",(lid,)).fetchall()
+    c.close()
+    slot=f'{lt["rack"]}/{lt["level"]}/{lt["position"]}' if lt["rack"] else "noch nicht eingelagert"
+    html=f"""<div class="kicker">LADUNGSTRÄGER</div><h1 class="page-title">{lt["carrier_no"]}</h1>
+    <div class="card"><div class="row"><div><span class="muted">Status</span><h2>{lt["status"]}</h2></div>
+    <div><span class="muted">Lagerplatz</span><h2>{slot}</h2></div></div></div>"""
+    if not lt["article_no"]:
+        html += '<div class="card"><h2>Ware auf Träger buchen</h2><form method="post"><input type="hidden" name="action" value="article">Artikel<select name="article_no">'
+        for a in arts:
+            html += f'<option value="{a["article_no"]}">{a["article_no"]} – {a["name"]}</option>'
+        html += '</select>Artikelanzahl<input type="number" name="quantity" min="1" required><button>Ware übernehmen</button></form></div>'
+    else:
+        html += f"""<div class="card"><h2>{lt["article_no"]} – {lt["article_name"]}</h2>
+        <div class="number">{lt["quantity"]}</div><div class="muted">Artikel auf diesem Ladungsträger</div></div>
+        <div class="scanbox"><h2>Seriennummer scannen</h2>
+        <form method="post"><input type="hidden" name="action" value="serial">
+        <input class="scan-input" name="serial_no" autofocus autocomplete="off" required placeholder="Seriennummer …">
+        <button>Seriennummer übernehmen</button></form>
+        <p class="muted">Erfasst: <b>{len(serials)}</b> Seriennummern</p></div>"""
+        if serials:
+            html += '<div class="card"><table><tr><th>Seriennummer</th><th>Zeit</th></tr>'
+            for s in serials[:100]:
+                html += f'<tr><td>{s["serial_no"]}</td><td>{s["created_at"]}</td></tr>'
+            html += '</table></div>'
+        if lt["status"]=="offen":
+            html += '<div class="card"><form method="post"><input type="hidden" name="action" value="close"><button>Ladungsträger abschließen</button></form></div>'
+        elif not lt["rack"]:
+            html += f'<div class="card"><a class="yellow-link" href="/store?carrier={lt["carrier_no"]}">Weiter zur Einlagerung →</a></div>'
+    return page(html,"carriers")
+
+
+def parse_slot(code):
+    try:
+        r,l,p=[int(x) for x in code.strip().split("/")]
+        if 1<=r<=30 and 1<=l<=4 and 1<=p<=83:
+            return r,l,p
+    except Exception:
+        pass
+    return None
+
+
+@app.route("/store", methods=["GET","POST"])
+def store():
+    msg=""
+    carrier_pref=request.args.get("carrier","")
+    if request.method=="POST":
+        carrier_no=request.form.get("carrier_no","").strip()
+        slot_code=request.form.get("slot_code","").strip()
+        parsed=parse_slot(slot_code)
+        c=con()
+        lt=c.execute("SELECT * FROM load_carriers WHERE carrier_no=?",(carrier_no,)).fetchone()
+        if not lt:
+            msg="Ladungsträger nicht gefunden."
+        elif lt["status"] not in ("bereit","eingelagert"):
+            msg="Ladungsträger zuerst abschließen."
+        elif not parsed:
+            msg="Lagerplatz ungültig. Format z. B. 22/1/82."
+        else:
+            r,l,p=parsed
+            slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+            art=c.execute("SELECT * FROM articles WHERE article_no=?",(lt["article_no"],)).fetchone()
+            rule=art["storage_rule"] if art else "Alle Ebenen"
+            if slot["load_carrier_id"] and slot["load_carrier_id"] != lt["id"]:
+                msg="Dieser Lagerplatz ist bereits belegt."
+            elif rule=="Nur Ebene 1" and l!=1:
+                msg="Dieser Artikel darf nur auf Ebene 1."
+            elif rule=="Nur Ebene 2-4" and l==1:
+                msg="Dieser Artikel darf nur auf Ebene 2–4."
+            else:
+                # Prevent Euro and Einweg directly next to each other.
+                neighbors=c.execute("""SELECT pallet_type FROM warehouse_slots
+                    WHERE rack=? AND level=? AND position IN (?,?) AND load_carrier_id IS NOT NULL""",
+                    (r,l,p-1,p+1)).fetchall()
+                this_euro=(lt["pallet_type"]=="Euro")
+                conflict=any((n["pallet_type"]=="Euro") != this_euro for n in neighbors if n["pallet_type"])
+                if conflict:
+                    msg="Nicht möglich: Euro und Einweg dürfen nicht direkt nebeneinander stehen."
+                else:
+                    old=f'{lt["rack"]}/{lt["level"]}/{lt["position"]}' if lt["rack"] else None
+                    if lt["rack"]:
+                        c.execute("""UPDATE warehouse_slots SET article_no=NULL,article_name=NULL,pallet_type=NULL,
+                                     quantity=NULL,container_id=NULL,occupied_at=NULL,load_carrier_no=NULL,load_carrier_id=NULL
+                                     WHERE load_carrier_id=?""",(lt["id"],))
+                    now=datetime.now().isoformat(timespec="minutes")
+                    c.execute("""UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,
+                                 container_id=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?
+                                 WHERE rack=? AND level=? AND position=?""",
+                              (lt["article_no"],lt["article_name"],lt["pallet_type"],lt["quantity"],
+                               lt["container_id"],now,lt["carrier_no"],lt["id"],r,l,p))
+                    c.execute("""UPDATE load_carriers SET rack=?,level=?,position=?,status='eingelagert',stored_at=?
+                                 WHERE id=?""",(r,l,p,now,lt["id"]))
+                    c.execute("""INSERT INTO movements(load_carrier_id,carrier_no,movement_type,from_slot,to_slot,created_at)
+                                 VALUES(?,?,?,?,?,?)""",(lt["id"],lt["carrier_no"],"Einlagerung/Umlagerung",old,slot_code,now))
+                    c.commit()
+                    c.close()
+                    return redirect(f"/carrier/{lt['id']}")
+        c.close()
+    html=f"""<div class="kicker">SCAN 3/3</div><h1 class="page-title">Einlagern</h1>
+    <div class="scanbox"><form method="post">
+      Ladungsträger scannen<input class="scan-input" name="carrier_no" value="{carrier_pref}" required autocomplete="off" placeholder="Ladungsträger …">
+      Lagerplatz scannen<input class="scan-input" name="slot_code" required autocomplete="off" placeholder="z. B. 22/1/82">
+      <button>Einlagerung bestätigen</button>
+    </form></div>"""
+    if msg: html += f'<div class="card"><b class="danger">{msg}</b></div>'
+    html += '<div class="card"><p class="muted">Die App prüft Belegung, Ebenenregel und Euro/Einweg-Nachbarschaft vor der Buchung.</p></div>'
+    return page(html,"warehouse")
 
 
 @app.route("/warehouse")
 def warehouse():
-    try:
-        rack = int(request.args.get("rack", 1))
-    except ValueError:
-        rack = 1
-    try:
-        level = int(request.args.get("level", 1))
-    except ValueError:
-        level = 1
-
-    rack = min(30, max(1, rack))
-    level = min(4, max(1, level))
-
-    c = con()
-    slots = c.execute(
-        """SELECT * FROM warehouse_slots
-           WHERE rack=? AND level=?
-           ORDER BY position""",
-        (rack, level)
-    ).fetchall()
-
-    occupied = c.execute(
-        """SELECT COUNT(*) FROM warehouse_slots
-           WHERE rack=? AND level=? AND article_no IS NOT NULL""",
-        (rack, level)
-    ).fetchone()[0]
+    try:r=max(1,min(30,int(request.args.get("rack",1))))
+    except:r=1
+    try:l=max(1,min(4,int(request.args.get("level",1))))
+    except:l=1
+    c=con()
+    slots=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? ORDER BY position",(r,l)).fetchall()
+    occ=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=? AND level=? AND load_carrier_id IS NOT NULL",(r,l)).fetchone()[0]
     c.close()
-
-    free = 83 - occupied
-
-    rack_options = "".join(
-        f'<option value="{r}" {"selected" if r == rack else ""}>Regal {r}</option>'
-        for r in range(1, 31)
-    )
-    level_options = "".join(
-        f'<option value="{l}" {"selected" if l == level else ""}>Ebene {l}</option>'
-        for l in range(1, 5)
-    )
-
-    html = f"""
-    <div class="kicker">LAGER</div>
-    <h1 class="page-title">Lagerübersicht</h1>
-
-    <div class="card">
-      <form method="get" class="warehouse-toolbar">
-        <div>
-          Regal
-          <select name="rack" onchange="this.form.submit()">
-            {rack_options}
-          </select>
-        </div>
-        <div>
-          Ebene
-          <select name="level" onchange="this.form.submit()">
-            {level_options}
-          </select>
-        </div>
-      </form>
-
-      <div class="row">
-        <div>
-          <div class="card-title">Belegt auf dieser Ebene</div>
-          <div class="number">{occupied}</div>
-        </div>
-        <div>
-          <div class="card-title">Frei auf dieser Ebene</div>
-          <div class="number">{free}</div>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="section-head">
-        <h2>Regal {rack} · Ebene {level}</h2>
-        <span class="muted">83 Stellplätze</span>
-      </div>
-      <div class="slot-grid">
-    """
-
-    for slot in slots:
-        code = f'{slot["rack"]}/{slot["level"]}/{slot["position"]}'
-        if slot["article_no"]:
-            html += f"""
-            <a class="slot occupied" href="/warehouse/slot/{slot["rack"]}/{slot["level"]}/{slot["position"]}">
-              <div class="slot-code">{code}</div>
-              <div class="slot-info">
-                {slot["article_no"]}<br>
-                {slot["article_name"] or ""}
-              </div>
-              <div class="slot-state">BELEGT</div>
-            </a>
-            """
+    ropts="".join(f'<option value="{x}" {"selected" if x==r else ""}>Regal {x}</option>' for x in range(1,31))
+    lopts="".join(f'<option value="{x}" {"selected" if x==l else ""}>Ebene {x}</option>' for x in range(1,5))
+    html=f"""<div class="kicker">LAGER</div><h1 class="page-title">9.960 Stellplätze</h1>
+    <div class="card"><form method="get" class="warehouse-toolbar">
+      <div>Regal<select name="rack" onchange="this.form.submit()">{ropts}</select></div>
+      <div>Ebene<select name="level" onchange="this.form.submit()">{lopts}</select></div>
+    </form><div class="row"><div><span class="muted">Belegt</span><div class="number">{occ}</div></div>
+    <div><span class="muted">Frei</span><div class="number">{83-occ}</div></div></div></div>
+    <div class="card"><div class="section-head"><h2>Regal {r} · Ebene {l}</h2><span class="muted">83 Plätze</span></div><div class="slot-grid">"""
+    for s in slots:
+        code=f'{r}/{l}/{s["position"]}'
+        if s["load_carrier_id"]:
+            html += f"""<a class="slot occupied" href="/carrier/{s["load_carrier_id"]}">
+              <div class="slot-code">{code}</div><div class="slot-info">{s["load_carrier_no"]}<br>{s["article_no"]}</div>
+              <div class="slot-state">BELEGT</div></a>"""
         else:
-            html += f"""
-            <a class="slot free" href="/warehouse/slot/{slot["rack"]}/{slot["level"]}/{slot["position"]}">
-              <div class="slot-code">{code}</div>
-              <div class="slot-info">Freier Lagerplatz</div>
-              <div class="slot-state">FREI</div>
-            </a>
-            """
-
+            html += f"""<div class="slot free"><div class="slot-code">{code}</div>
+              <div class="slot-info">Freier Lagerplatz</div><div class="slot-state">FREI</div></div>"""
     html += "</div></div>"
-    return page(html, "warehouse")
+    return page(html,"warehouse")
 
 
-@app.route("/warehouse/slot/<int:rack>/<int:level>/<int:position>", methods=["GET", "POST"])
-def warehouse_slot(rack, level, position):
-    if not (1 <= rack <= 30 and 1 <= level <= 4 and 1 <= position <= 83):
-        return redirect("/warehouse")
-
-    c = con()
-    slot = c.execute(
-        """SELECT * FROM warehouse_slots
-           WHERE rack=? AND level=? AND position=?""",
-        (rack, level, position)
-    ).fetchone()
-
-    if not slot:
+@app.route("/search", methods=["GET"])
+def search_page():
+    q=request.args.get("q","").strip()
+    results=[]
+    if q:
+        c=con()
+        results=c.execute("""SELECT DISTINCT lc.* FROM load_carriers lc
+          LEFT JOIN serial_numbers sn ON sn.load_carrier_id=lc.id
+          WHERE lc.carrier_no LIKE ? OR lc.article_no LIKE ? OR lc.article_name LIKE ? OR sn.serial_no LIKE ?
+          ORDER BY lc.id DESC LIMIT 100""",(f"%{q}%",f"%{q}%",f"%{q}%",f"%{q}%")).fetchall()
         c.close()
-        return redirect("/warehouse")
+    html=f"""<div class="kicker">SUCHE</div><h1 class="page-title">Ware finden</h1>
+    <div class="scanbox"><form method="get"><input class="scan-input" name="q" value="{q}" autofocus
+    placeholder="Artikel, Seriennummer oder Ladungsträger …"><button>Suchen</button></form></div>"""
+    if q:
+        html += '<div class="card"><table><tr><th>Träger</th><th>Artikel</th><th>Platz</th><th>Status</th></tr>'
+        for x in results:
+            slot=f'{x["rack"]}/{x["level"]}/{x["position"]}' if x["rack"] else "–"
+            html += f'<tr><td><a style="color:white" href="/carrier/{x["id"]}">{x["carrier_no"]}</a></td><td>{x["article_no"] or "–"}</td><td><b>{slot}</b></td><td>{x["status"]}</td></tr>'
+        if not results: html += '<tr><td colspan="4" class="muted">Nichts gefunden.</td></tr>'
+        html += "</table></div>"
+    return page(html,"carriers")
 
-    if request.method == "POST":
-        action = request.form.get("action", "assign")
 
-        if action == "clear":
-            c.execute(
-                """UPDATE warehouse_slots
-                   SET article_no=NULL, article_name=NULL, pallet_type=NULL,
-                       quantity=NULL, container_id=NULL, occupied_at=NULL
-                   WHERE rack=? AND level=? AND position=?""",
-                (rack, level, position)
-            )
-            c.commit()
-            c.close()
-            return redirect(f"/warehouse?rack={rack}&level={level}")
-
-        article_no = request.form.get("article_no", "").strip()
-        article = c.execute(
-            "SELECT * FROM articles WHERE article_no=?",
-            (article_no,)
-        ).fetchone()
-
-        if article:
-            qty = request.form.get("quantity", "").strip()
-            qty = int(qty) if qty.isdigit() else 1
-
-            c.execute(
-                """UPDATE warehouse_slots
-                   SET article_no=?, article_name=?, pallet_type=?,
-                       quantity=?, occupied_at=?
-                   WHERE rack=? AND level=? AND position=?""",
-                (
-                    article["article_no"],
-                    article["name"],
-                    article["pallet_type"],
-                    qty,
-                    datetime.now().isoformat(timespec="minutes"),
-                    rack, level, position
-                )
-            )
-            c.commit()
-
-        c.close()
-        return redirect(f"/warehouse?rack={rack}&level={level}")
-
-    articles = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
+@app.route("/archive")
+def archive():
+    c=con()
+    moves=c.execute("SELECT * FROM movements ORDER BY id DESC LIMIT 250").fetchall()
     c.close()
-
-    code = f"{rack}/{level}/{position}"
-
-    html = f"""
-    <div class="kicker">LAGERPLATZ</div>
-    <h1 class="page-title">{code}</h1>
-
-    <div class="card">
-    """
-
-    if slot["article_no"]:
-        html += f"""
-        <h2>Belegt</h2>
-        <p><b>Artikel:</b> {slot["article_no"]} – {slot["article_name"] or ""}</p>
-        <p><b>Palettentyp:</b> {slot["pallet_type"] or "–"}</p>
-        <p><b>Menge:</b> {slot["quantity"] or 1}</p>
-        <form method="post">
-          <input type="hidden" name="action" value="clear">
-          <button type="submit">Lagerplatz freigeben</button>
-        </form>
-        """
-    else:
-        html += """
-        <h2>Freier Lagerplatz</h2>
-        """
-
-        if articles:
-            html += '<form method="post"><input type="hidden" name="action" value="assign">Artikel<select name="article_no">'
-            for article in articles:
-                html += (
-                    f'<option value="{article["article_no"]}">'
-                    f'{article["article_no"]} – {article["name"]} · {article["pallet_type"]}'
-                    f'</option>'
-                )
-            html += """
-            </select>
-            Menge / Paletteneinheit
-            <input type="number" name="quantity" min="1" value="1">
-            <button type="submit">Auf Lagerplatz einlagern</button>
-            </form>
-            """
-        else:
-            html += '<p class="muted">Bitte zuerst einen Artikel anlegen.</p>'
-
-    html += f"""
-      <p style="margin-top:18px">
-        <a class="yellow-link" href="/warehouse?rack={rack}&level={level}">← Zurück zu Regal {rack}, Ebene {level}</a>
-      </p>
-    </div>
-    """
-
-    return page(html, "warehouse")
+    html="""<div class="kicker">ARCHIV</div><h1 class="page-title">Bewegungsverlauf</h1>
+    <div class="card"><table><tr><th>Zeit</th><th>Ladungsträger</th><th>Vorgang</th><th>Von</th><th>Nach</th></tr>"""
+    for m in moves:
+        html += f'<tr><td>{m["created_at"]}</td><td>{m["carrier_no"] or "–"}</td><td>{m["movement_type"]}</td><td>{m["from_slot"] or "–"}</td><td>{m["to_slot"] or "–"}</td></tr>'
+    html += "</table></div>"
+    return page(html,"archive")
 
 
 @app.route("/gates")
