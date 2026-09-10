@@ -1,534 +1,77 @@
-from flask import Flask, request, redirect, url_for, render_template_string
-import sqlite3
-import os
-import math
+from flask import Flask, request, redirect, render_template_string
+import sqlite3, os, math
+from datetime import datetime
 
-app = Flask(__name__)
+app=Flask(__name__)
+DB=os.environ.get("LAGERPRO_DB",os.path.join(os.path.dirname(__file__),"lagerpro.db"))
 
-DB = os.path.join(os.path.dirname(__file__), "lagerpro.db")
+def con():
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
+def calc(q,cpp):
+    q=int(q); cpp=max(1,int(cpp)); return q//cpp,q%cpp,math.ceil(q/cpp) if q else 0
+def init():
+    c=con(); c.executescript('''
+CREATE TABLE IF NOT EXISTS articles(id INTEGER PRIMARY KEY,article_no TEXT UNIQUE,name TEXT,pallet_type TEXT,cpp INTEGER,storage_rule TEXT);
+CREATE TABLE IF NOT EXISTS containers(id INTEGER PRIMARY KEY,container_no TEXT,gate_no INTEGER,status TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY,container_id INTEGER,article_no TEXT,name TEXT,cartons INTEGER,cpp INTEGER,pallet_type TEXT);
+'''); c.commit(); c.close()
 
-
-def db():
-    con = sqlite3.connect(DB)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def init_db():
-    con = db()
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            article_no TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            pallet_type TEXT NOT NULL,
-            cartons_per_pallet INTEGER NOT NULL DEFAULT 1,
-            storage_rule TEXT DEFAULT 'Alle Ebenen'
-        )
-    """)
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS containers (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            container_no TEXT NOT NULL,
-            gate_no INTEGER,
-            status TEXT DEFAULT 'offen',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS container_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            container_id INTEGER NOT NULL,
-            article_no TEXT NOT NULL,
-            name TEXT NOT NULL,
-            cartons INTEGER NOT NULL,
-            cartons_per_pallet INTEGER NOT NULL,
-            pallet_type TEXT NOT NULL,
-            FOREIGN KEY(container_id) REFERENCES containers(id)
-        )
-    """)
-
-    con.commit()
-    con.close()
-
-
-init_db()
-
+STYLE='''<style>*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#e6edf3;font-family:-apple-system,Segoe UI,sans-serif}header{padding:20px;background:#161b22}.brand{font-size:25px;font-weight:800}.muted{color:#8b949e}nav{display:flex;gap:8px;overflow:auto;padding:12px}nav a,.btn,button{background:#238636;color:white;text-decoration:none;border:0;border-radius:10px;padding:11px 14px;font-weight:700}nav a{background:#21262d;white-space:nowrap}main{max-width:1100px;margin:auto;padding:16px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:#161b22;border:1px solid #30363d;border-radius:16px;padding:16px;margin-bottom:14px}.kpi{font-size:28px;font-weight:800}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}input,select{width:100%;padding:12px;margin:5px 0 10px;background:#0d1117;color:white;border:1px solid #30363d;border-radius:10px}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #30363d;text-align:left}.gates{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.gate{text-align:center;padding:18px;background:#0d1117;border-radius:14px;border:1px solid #30363d}.badge{background:#30363d;border-radius:20px;padding:5px 9px}@media(max-width:700px){.grid{grid-template-columns:1fr 1fr}.row{grid-template-columns:1fr}.gates{grid-template-columns:1fr 1fr}table{display:block;overflow:auto}}</style>'''
+def page(body):
+    return render_template_string('<meta name="viewport" content="width=device-width,initial-scale=1">'+STYLE+'<header><div class="brand">ð¦ LagerPro</div><div class="muted">Mobile Lager- & Containerverwaltung</div></header><nav><a href="/">Dashboard</a><a href="/articles">Artikel</a><a href="/containers">Container</a><a href="/gates">Tore 8â12</a></nav><main>'+body+'</main>')
 
 @app.route("/")
-def dashboard():
-    con = db()
-
-    articles = con.execute(
-        "SELECT * FROM articles ORDER BY article_no"
-    ).fetchall()
-
-    containers = con.execute("""
-        SELECT * FROM containers
-        ORDER BY id DESC
-    """).fetchall()
-
-    total_cartons = con.execute("""
-        SELECT COALESCE(SUM(cartons), 0)
-        FROM container_items
-    """).fetchone()[0]
-
-    pallet_places = 0
-
-    rows = con.execute("""
-        SELECT cartons, cartons_per_pallet
-        FROM container_items
-    """).fetchall()
-
-    for row in rows:
-        cpp = max(1, row["cartons_per_pallet"])
-        pallet_places += math.ceil(row["cartons"] / cpp)
-
-    con.close()
-
-    return render_template_string(
-        PAGE,
-        articles=articles,
-        containers=containers,
-        total_cartons=total_cartons,
-        pallet_places=pallet_places
-    )
-
-
-@app.route("/article/add", methods=["POST"])
-def add_article():
-    article_no = request.form["article_no"].strip()
-    name = request.form["name"].strip()
-    pallet_type = request.form["pallet_type"]
-    cartons_per_pallet = max(
-        1, int(request.form["cartons_per_pallet"])
-    )
-    storage_rule = request.form["storage_rule"]
-
-    con = db()
-
-    con.execute("""
-        INSERT OR REPLACE INTO articles
-        (article_no, name, pallet_type,
-         cartons_per_pallet, storage_rule)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        article_no,
-        name,
-        pallet_type,
-        cartons_per_pallet,
-        storage_rule
-    ))
-
-    con.commit()
-    con.close()
-
-    return redirect(url_for("dashboard"))
-
-
-@app.route("/container/add", methods=["POST"])
-def add_container():
-    container_no = request.form["container_no"].strip()
-    gate = request.form.get("gate_no")
-
-    gate = int(gate) if gate else None
-
-    con = db()
-
-    con.execute("""
-        INSERT INTO containers
-        (container_no, gate_no, status)
-        VALUES (?, ?, 'offen')
-    """, (container_no, gate))
-
-    con.commit()
-    con.close()
-
-    return redirect(url_for("dashboard"))
-
-
-@app.route("/container/<int:container_id>/delete", methods=["POST"])
-def delete_container(container_id):
-    con = db()
-
-    con.execute(
-        "DELETE FROM container_items WHERE container_id=?",
-        (container_id,)
-    )
-
-    con.execute(
-        "DELETE FROM containers WHERE id=?",
-        (container_id,)
-    )
-
-    con.commit()
-    con.close()
-
-    return redirect(url_for("dashboard"))
-
-
-PAGE = """
-<!doctype html>
-<html lang="de">
-<head>
-
-<meta charset="utf-8">
-<meta name="viewport"
-content="width=device-width,initial-scale=1,viewport-fit=cover">
-
-<title>LagerPro</title>
-
-<style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    background: #0b0f17;
-    color: #f4f7fb;
-    font-family: -apple-system, BlinkMacSystemFont,
-                 "Segoe UI", sans-serif;
-}
-
-header {
-    padding: 22px;
-    background: #111827;
-    border-bottom: 1px solid #263244;
-}
-
-.logo {
-    font-size: 26px;
-    font-weight: 800;
-}
-
-.subtitle {
-    color: #94a3b8;
-    margin-top: 4px;
-}
-
-main {
-    padding: 18px;
-    max-width: 1200px;
-    margin: auto;
-}
-
-.cards {
-    display: grid;
-    grid-template-columns: repeat(2,1fr);
-    gap: 12px;
-}
-
-.card {
-    background: #131b29;
-    border: 1px solid #263244;
-    border-radius: 16px;
-    padding: 16px;
-    margin-bottom: 16px;
-}
-
-.number {
-    font-size: 30px;
-    font-weight: 800;
-}
-
-.label {
-    color: #94a3b8;
-}
-
-h2 {
-    margin-top: 4px;
-}
-
-input, select {
-    width: 100%;
-    padding: 13px;
-    margin: 6px 0;
-    background: #0d1420;
-    border: 1px solid #334155;
-    border-radius: 10px;
-    color: white;
-    font-size: 16px;
-}
-
-button {
-    border: 0;
-    border-radius: 10px;
-    padding: 12px 15px;
-    font-size: 15px;
-    font-weight: 700;
-    cursor: pointer;
-}
-
-.primary {
-    background: #6366f1;
-    color: white;
-    width: 100%;
-    margin-top: 8px;
-}
-
-.delete {
-    background: #7f1d1d;
-    color: white;
-}
-
-table {
-    width: 100%;
-    border-collapse: collapse;
-}
-
-th, td {
-    padding: 11px 8px;
-    border-bottom: 1px solid #263244;
-    text-align: left;
-}
-
-th {
-    color: #94a3b8;
-}
-
-.scroll {
-    overflow-x: auto;
-}
-
-@media(min-width:800px) {
-    .cards {
-        grid-template-columns: repeat(4,1fr);
-    }
-
-    .forms {
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 16px;
-    }
-}
-
-</style>
-
-</head>
-
-<body>
-
-<header>
-<div class="logo">📦 LagerPro</div>
-<div class="subtitle">
-Warehouse Management
-</div>
-</header>
-
-<main>
-
-<div class="cards">
-
-<div class="card">
-<div class="number">{{ articles|length }}</div>
-<div class="label">Artikel</div>
-</div>
-
-<div class="card">
-<div class="number">{{ containers|length }}</div>
-<div class="label">Container</div>
-</div>
-
-<div class="card">
-<div class="number">{{ total_cartons }}</div>
-<div class="label">Kartons</div>
-</div>
-
-<div class="card">
-<div class="number">{{ pallet_places }}</div>
-<div class="label">Palettenplätze</div>
-</div>
-
-</div>
-
-
-<div class="forms">
-
-<div class="card">
-
-<h2>Artikel hinzufügen</h2>
-
-<form method="post" action="/article/add">
-
-<input
-name="article_no"
-placeholder="Artikelnummer"
-required>
-
-<input
-name="name"
-placeholder="Artikelname"
-required>
-
-<select name="pallet_type">
-<option>Euro</option>
-<option>Einweg</option>
-<option>115x115</option>
-</select>
-
-<input
-name="cartons_per_pallet"
-type="number"
-min="1"
-placeholder="Kartons pro Vollpalette"
-required>
-
-<select name="storage_rule">
-<option>Alle Ebenen</option>
-<option>Nur Ebene 1</option>
-<option>Nur Ebenen 2-4</option>
-</select>
-
-<button class="primary">
-Artikel speichern
-</button>
-
-</form>
-
-</div>
-
-
-<div class="card">
-
-<h2>Container hinzufügen</h2>
-
-<form method="post" action="/container/add">
-
-<input
-name="container_no"
-placeholder="Containernummer"
-required>
-
-<select name="gate_no">
-
-<option value="">
-Kein Tor
-</option>
-
-<option value="8">Tor 8</option>
-<option value="9">Tor 9</option>
-<option value="10">Tor 10</option>
-<option value="11">Tor 11</option>
-<option value="12">Tor 12</option>
-
-</select>
-
-<button class="primary">
-Container anlegen
-</button>
-
-</form>
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-<h2>Container</h2>
-
-<div class="scroll">
-
-<table>
-
-<tr>
-<th>Container</th>
-<th>Tor</th>
-<th>Status</th>
-<th></th>
-</tr>
-
-{% for c in containers %}
-
-<tr>
-
-<td>{{ c.container_no }}</td>
-
-<td>
-{% if c.gate_no %}
-Tor {{ c.gate_no }}
-{% else %}
--
-{% endif %}
-</td>
-
-<td>{{ c.status }}</td>
-
-<td>
-
-<form
-method="post"
-action="/container/{{ c.id }}/delete"
-onsubmit="return confirm('Container wirklich löschen?');">
-
-<button class="delete">
-Löschen
-</button>
-
-</form>
-
-</td>
-
-</tr>
-
-{% endfor %}
-
-</table>
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-<h2>Artikelstamm</h2>
-
-<div class="scroll">
-
-<table>
-
-<tr>
-<th>Nr.</th>
-<th>Artikel</th>
-<th>Palette</th>
-<th>Kartons/Palette</th>
-<th>Lagerregel</th>
-</tr>
-
-{% for a in articles %}
-
-<tr>
-
-<td>{{ a.article_no }}</td>
-<td>{{ a.name }}</td>
-<td>{{ a.pallet_type }}</td>
-<td>{{ a.cartons_per_pallet }}</td>
-<td>{{ a.storage_rule }}</td>
-
-</tr>
-
-{% endfor %}
-
-</table>
-
-</div>
-
-</div>
-
-</main>
-
-</body>
-</html>
-"""
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+def home():
+    c=con(); ac=c.execute("SELECT COUNT(*) n FROM articles").fetchone()["n"]; cs=c.execute("SELECT * FROM containers WHERE status!='erledigt'").fetchall(); its=c.execute("SELECT * FROM items").fetchall(); c.close()
+    cartons=sum(x["cartons"] for x in its); places=sum(calc(x["cartons"],x["cpp"])[2] for x in its)
+    b=f'<div class="grid"><div class="card"><span class="muted">Artikel</span><div class="kpi">{ac}</div></div><div class="card"><span class="muted">Offene Container</span><div class="kpi">{len(cs)}</div></div><div class="card"><span class="muted">Kartons</span><div class="kpi">{cartons}</div></div><div class="card"><span class="muted">PalettenplÃ¤tze</span><div class="kpi">{places}</div></div></div><div class="card"><h2>Aktive Container</h2>'
+    b+=''.join(f'<p><a class="btn" href="/container/{x["id"]}">{x["container_no"]}</a> &nbsp; Tor {x["gate_no"] or "â"} Â· <span class="badge">{x["status"]}</span></p>' for x in cs) or '<p class="muted">Noch keine Container.</p>'
+    return page(b+'</div>')
+
+@app.route("/articles",methods=["GET","POST"])
+def articles():
+    c=con()
+    if request.method=="POST":
+        c.execute("INSERT INTO articles(article_no,name,pallet_type,cpp,storage_rule) VALUES(?,?,?,?,?) ON CONFLICT(article_no) DO UPDATE SET name=excluded.name,pallet_type=excluded.pallet_type,cpp=excluded.cpp,storage_rule=excluded.storage_rule",(request.form["no"].strip(),request.form["name"].strip(),request.form["ptype"],max(1,int(request.form["cpp"])),request.form["rule"])); c.commit(); c.close(); return redirect("/articles")
+    rows=c.execute("SELECT * FROM articles ORDER BY article_no").fetchall(); c.close()
+    b='''<div class="card"><h2>Artikelstamm</h2><form method="post"><div class="row"><div>Artikelnummer<input name="no" required></div><div>Artikelname<input name="name" required></div></div><div class="row"><div>Kartons pro Vollpalette<input type="number" min="1" name="cpp" required></div><div>Palettentyp<select name="ptype"><option>Euro</option><option>Einweg</option><option>Einweg 115 x 115</option></select></div></div>Lageregel<select name="rule"><option>Alle Ebenen</option><option>Nur Ebene 1</option><option>Nur Ebene 2-4</option></select><button>Speichern</button></form></div><div class="card"><h2>Artikel</h2><table><tr><th>Nr.</th><th>Name</th><th>Kartons/Palette</th><th>Palette</th><th>Regel</th></tr>'''
+    for x in rows:b+=f'<tr><td>{x["article_no"]}</td><td>{x["name"]}</td><td>{x["cpp"]}</td><td>{x["pallet_type"]}</td><td>{x["storage_rule"]}</td></tr>'
+    return page(b+'</table></div>')
+
+@app.route("/containers",methods=["GET","POST"])
+def containers():
+    c=con()
+    if request.method=="POST":
+        g=int(request.form["gate"]) if request.form["gate"] else None
+        c.execute("INSERT INTO containers(container_no,gate_no,status,created_at) VALUES(?,?,?,?)",(request.form["no"].strip(),g,request.form["status"],datetime.now().isoformat(timespec="minutes"))); c.commit(); c.close(); return redirect("/containers")
+    rows=c.execute("SELECT * FROM containers ORDER BY id DESC").fetchall(); c.close()
+    opts=''.join(f'<option>{g}</option>' for g in range(8,13))
+    b=f'''<div class="card"><h2>Container anlegen</h2><form method="post">Containernummer<input name="no" required><div class="row"><div>Tor<select name="gate"><option value="">Kein Tor</option>{opts}</select></div><div>Status<select name="status"><option>geplant</option><option>vor Ort</option><option>verspÃ¤tet</option><option>bereit</option><option>erledigt</option></select></div></div><button>Anlegen</button></form></div><div class="card"><h2>Container</h2>'''
+    b+=''.join(f'<p><a class="btn" href="/container/{x["id"]}">{x["container_no"]}</a> &nbsp; Tor {x["gate_no"] or "â"} Â· {x["status"]}</p>' for x in rows)
+    return page(b+'</div>')
+
+@app.route("/container/<int:cid>",methods=["GET","POST"])
+def container(cid):
+    c=con(); co=c.execute("SELECT * FROM containers WHERE id=?",(cid,)).fetchone()
+    if request.method=="POST":
+        a=c.execute("SELECT * FROM articles WHERE article_no=?",(request.form["article"],)).fetchone()
+        if a:c.execute("INSERT INTO items(container_id,article_no,name,cartons,cpp,pallet_type) VALUES(?,?,?,?,?,?)",(cid,a["article_no"],a["name"],int(request.form["cartons"]),a["cpp"],a["pallet_type"]));c.commit()
+        c.close();return redirect(f"/container/{cid}")
+    arts=c.execute("SELECT * FROM articles ORDER BY article_no").fetchall(); its=c.execute("SELECT * FROM items WHERE container_id=?",(cid,)).fetchall();c.close()
+    b=f'<div class="card"><h2>{co["container_no"]}</h2><p>Tor {co["gate_no"] or "â"} Â· <span class="badge">{co["status"]}</span></p></div><div class="card"><h2>Kartons hinzufÃ¼gen</h2>'
+    if arts:b+='<form method="post">Artikel<select name="article">'+''.join(f'<option value="{a["article_no"]}">{a["article_no"]} â {a["name"]} ({a["cpp"]}/Palette)</option>' for a in arts)+'</select>Kartonanzahl<input type="number" min="1" name="cartons" required><button>HinzufÃ¼gen</button></form>'
+    else:b+='<p>Bitte zuerst einen Artikel anlegen.</p>'
+    b+='</div><div class="card"><h2>Containerinhalt</h2><table><tr><th>Artikel</th><th>Kartons</th><th>Voll</th><th>Rest</th><th>PlÃ¤tze</th></tr>'; total=0
+    for x in its:
+        f,r,p=calc(x["cartons"],x["cpp"]);total+=p;b+=f'<tr><td>{x["article_no"]}<br><span class="muted">{x["name"]}</span></td><td>{x["cartons"]}</td><td>{f}</td><td>{r}</td><td><b>{p}</b></td></tr>'
+    return page(b+f'</table><h3>BenÃ¶tigte StellplÃ¤tze: {total}</h3></div>')
+
+@app.route("/gates")
+def gates():
+    c=con();rows=c.execute("SELECT * FROM containers WHERE status!='erledigt' AND gate_no BETWEEN 8 AND 12").fetchall();c.close();d={x["gate_no"]:x for x in rows};b='<div class="card"><h2>Hallentore 8â12</h2><div class="gates">'
+    for g in range(8,13):
+        x=d.get(g);b+=f'<div class="gate"><div class="kpi">{g}</div>'+(f'<b>{x["container_no"]}</b><br>{x["status"]}' if x else '<span class="muted">Frei</span>')+'</div>'
+    return page(b+'</div></div>')
+
+init()
+if __name__=="__main__":app.run(host="0.0.0.0",port=int(os.environ.get("PORT","8080")))
