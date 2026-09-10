@@ -1753,6 +1753,8 @@ def camera_confirm():
 
 
 
+
+
 @app.route("/manual-booking", methods=["GET","POST"])
 def manual_booking():
     msg=""
@@ -1761,93 +1763,183 @@ def manual_booking():
 
     if request.method=="POST":
         article_no=request.form.get("article_no","").strip()
+        article_name_input=request.form.get("article_name","").strip()
         slot_code=request.form.get("slot_code","").strip()
+
         try:
-            quantity=max(1,int(float((request.form.get("quantity","1") or "1").replace(",","."))))
+            cartons_on_pallet=max(1,int(float((request.form.get("cartons_on_pallet","1") or "1").replace(",","."))))
         except Exception:
-            quantity=1
+            cartons_on_pallet=1
 
-        article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone()
-        parsed=parse_slot(slot_code)
-
-        if not article:
-            msg=f"Artikel {article_no} ist nicht im Artikelstamm vorhanden."
-        elif not parsed:
-            msg="Lagerplatz ungültig. Format z. B. 22/3/37."
+        if not article_no:
+            msg="Bitte eine Artikelnummer eingeben."
+        elif not article_name_input:
+            msg="Bitte den Artikelnamen eingeben."
         else:
-            r,l,p=parsed
-            slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+            article=c.execute("""
+                SELECT *,
+                       COALESCE(NULLIF(article_name,''), NULLIF(name,''), article_no) AS booking_article_name
+                FROM articles
+                WHERE article_no=?
+            """,(article_no,)).fetchone()
 
-            if not slot:
-                msg="Lagerplatz existiert nicht."
-            elif slot["slot_status"]=="gesperrt":
-                msg=f'Lagerplatz ist gesperrt: {slot["block_reason"] or "kein Grund angegeben"}.'
-            elif slot["load_carrier_id"]:
-                msg=f'Der Platz ist bereits durch {slot["load_carrier_no"] or "einen Ladungsträger"} belegt.'
+            created_new=False
+
+            if not article:
+                # Neuer Artikel wird direkt mit den eingegebenen Stammdaten angelegt.
+                c.execute("""
+                    INSERT INTO articles(
+                        article_no,name,article_name,pallet_type,cpp,storage_rule,units_per_carton
+                    )
+                    VALUES(?,?,?,?,?,?,?)
+                """,(
+                    article_no,
+                    article_name_input,
+                    article_name_input,
+                    "Euro",
+                    cartons_on_pallet,
+                    "Alle Ebenen",
+                    1
+                ))
+                c.commit()
+                created_new=True
             else:
-                rule=(article["storage_rule"] or "Egal")
-                if rule=="Nur Ebene 1" and l!=1:
-                    msg="Dieser Artikel darf nur auf Ebene 1 eingelagert werden."
-                elif rule=="Nur Ebene 2-4" and l==1:
-                    msg="Dieser Artikel darf nur auf Ebene 2–4 eingelagert werden."
+                # Bei manueller Buchung werden Name und Kartons/Palette direkt
+                # auch im Artikelstamm aktualisiert.
+                c.execute("""
+                    UPDATE articles
+                    SET name=?, article_name=?, cpp=?
+                    WHERE article_no=?
+                """,(
+                    article_name_input,
+                    article_name_input,
+                    cartons_on_pallet,
+                    article_no
+                ))
+                c.commit()
+
+            article=c.execute("""
+                SELECT *,
+                       COALESCE(NULLIF(article_name,''), NULLIF(name,''), article_no) AS booking_article_name
+                FROM articles
+                WHERE article_no=?
+            """,(article_no,)).fetchone()
+
+            parsed=parse_slot(slot_code)
+
+            if not parsed:
+                msg="Lagerplatz ungültig. Format z. B. 22/3/37."
+            else:
+                r,l,p=parsed
+                slot=c.execute(
+                    "SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",
+                    (r,l,p)
+                ).fetchone()
+
+                if not slot:
+                    msg="Lagerplatz existiert nicht."
+                elif slot["slot_status"]=="gesperrt":
+                    msg=f'Lagerplatz ist gesperrt: {slot["block_reason"] or "kein Grund angegeben"}.'
+                elif slot["load_carrier_id"]:
+                    msg=f'Der Platz ist bereits durch {slot["load_carrier_no"] or "einen Ladungsträger"} belegt.'
                 else:
-                    stamp=datetime.now().strftime("%Y%m%d%H%M%S%f")
-                    carrier_no=f"MAN-{r}-{l}-{p}-{stamp[-6:]}"
-                    now=datetime.now().isoformat(timespec="minutes")
+                    rule=(article["storage_rule"] or "Alle Ebenen")
+                    if rule in ("Nur Ebene 1","nur Ebene 1") and l!=1:
+                        msg="Dieser Artikel darf nur auf Ebene 1 eingelagert werden."
+                    elif rule in ("Nur Ebene 2-4","nur Ebene 2-4") and l==1:
+                        msg="Dieser Artikel darf nur auf Ebene 2–4 eingelagert werden."
+                    else:
+                        stamp=datetime.now().strftime("%Y%m%d%H%M%S%f")
+                        carrier_no=f"MAN-{r}-{l}-{p}-{stamp[-6:]}"
+                        now=datetime.now().isoformat(timespec="minutes")
 
-                    c.execute(
-                        "INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,closed_at,stored_at,quality_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (carrier_no,article["article_no"],article["booking_article_name"],quantity,
-                         article["pallet_type"],"eingelagert",r,l,p,now,now,now,"frei")
-                    )
-                    lid=c.lastrowid
+                        # quantity = Kartons auf dieser Palette / diesem Lagerplatz
+                        c.execute(
+                            "INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,closed_at,stored_at,quality_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                carrier_no,
+                                article["article_no"],
+                                article["booking_article_name"],
+                                cartons_on_pallet,
+                                article["pallet_type"],
+                                "eingelagert",
+                                r,l,p,now,now,now,"frei"
+                            )
+                        )
+                        lid=c.lastrowid
 
-                    c.execute(
-                        "UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?,slot_status='belegt' WHERE rack=? AND level=? AND position=?",
-                        (article["article_no"],article["booking_article_name"],article["pallet_type"],quantity,
-                         now,carrier_no,lid,r,l,p)
-                    )
+                        c.execute(
+                            "UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?,slot_status='belegt' WHERE rack=? AND level=? AND position=?",
+                            (
+                                article["article_no"],
+                                article["booking_article_name"],
+                                article["pallet_type"],
+                                cartons_on_pallet,
+                                now,
+                                carrier_no,
+                                lid,
+                                r,l,p
+                            )
+                        )
 
-                    c.execute(
-                        "INSERT INTO movements(load_carrier_id,carrier_no,movement_type,from_slot,to_slot,created_at) VALUES(?,?,?,?,?,?)",
-                        (lid,carrier_no,"Manuelle Direktbuchung",None,slot_code,now)
-                    )
+                        c.execute(
+                            "INSERT INTO movements(load_carrier_id,carrier_no,movement_type,from_slot,to_slot,created_at) VALUES(?,?,?,?,?,?)",
+                            (lid,carrier_no,"Manuelle Direktbuchung",None,slot_code,now)
+                        )
 
-                    c.commit()
-                    msg=f'{article["article_no"]} - {article["booking_article_name"]} wurde mit Menge {quantity} auf {slot_code} gebucht.'
-                    success=True
+                        c.commit()
+                        prefix="Neuer Artikel automatisch im Artikelstamm angelegt. " if created_new else "Artikelstamm automatisch aktualisiert. "
+                        msg=prefix + f'{article["article_no"]} - {article["booking_article_name"]}: {cartons_on_pallet} Kartons auf {slot_code} gebucht.'
+                        success=True
 
     articles=c.execute("""
-        SELECT article_no, COALESCE(NULLIF(article_name,''), name, article_no) AS article_name
-        FROM articles ORDER BY article_no LIMIT 500
+        SELECT article_no,
+               COALESCE(NULLIF(article_name,''), NULLIF(name,''), article_no) AS article_name,
+               cpp
+        FROM articles
+        ORDER BY article_no
+        LIMIT 500
     """).fetchall()
     c.close()
 
     html="""<div class="kicker">MANUELLE DIREKTBUCHUNG</div>
     <h1 class="page-title">Artikel direkt auf Lagerplatz buchen</h1>
+
     <div class="notice">
-      <b>Schnellfunktion für den Lagergang.</b><br>
-      <span class="muted">Artikelnummer eingeben oder scannen, Lagerplatz eingeben/scannen und buchen.
-      Im Hintergrund erzeugt die App automatisch einen technischen MAN-Ladungsträger, damit Historie und Lagerstruktur sauber bleiben.</span>
+      <b>Artikelstamm wird automatisch mitgeführt.</b><br>
+      <span class="muted">
+        Du gibst Artikelnummer, Artikelname, Kartons auf der Palette und Lagerplatz ein.
+        Ist der Artikel neu, wird er automatisch angelegt. Ist er vorhanden, werden Name und Kartons pro Palette aktualisiert.
+      </span>
     </div>
+
     <div class="card">
       <form method="post">
         Artikelnummer
         <input class="scan-input" name="article_no" list="article-list" required autofocus placeholder="z. B. LD660807">
+
         <datalist id="article-list">"""
+
     for a in articles:
-        html += f'<option value="{a["article_no"]}">{a["article_name"]}</option>'
+        html += f'<option value="{a["article_no"]}">{a["article_name"]} - {a["cpp"]} Kartons/Palette</option>'
+
     html += """</datalist>
+
+        Artikelname
+        <input class="scan-input" name="article_name" required placeholder="z. B. Leichtgewichtrollator">
+
         <div class="row">
+          <div>
+            Kartons auf Palette
+            <input class="scan-input" type="number" min="1" name="cartons_on_pallet" value="1" required>
+            <span class="muted">Wird gleichzeitig als „Kartons pro Palette“ im Artikelstamm gespeichert.</span>
+          </div>
           <div>
             Lagerplatz
             <input class="scan-input" name="slot_code" required placeholder="z. B. 22/3/37">
           </div>
-          <div>
-            Menge
-            <input class="scan-input" type="number" min="1" name="quantity" value="1" required>
-          </div>
         </div>
+
         <button>Artikel auf Lagerplatz buchen</button>
       </form>
     </div>"""
@@ -1858,9 +1950,15 @@ def manual_booking():
 
     html += """<div class="card">
       <h2>Beispiel</h2>
-      <p><b>Artikel:</b> LD660807 &nbsp; - &nbsp; <b>Lagerplatz:</b> 22/3/37 &nbsp; - &nbsp; <b>Menge:</b> 1</p>
-      <p class="muted">Die Buchung erscheint danach sofort in Lageransicht, Suche und Bewegungsverlauf.</p>
+      <p>
+        Artikelnummer <b>LD660807</b> · Artikel <b>Leichtgewichtrollator</b> ·
+        <b>10 Kartons</b> · Lagerplatz <b>22/3/37</b>
+      </p>
+      <p class="muted">
+        Danach steht der Artikel automatisch im Artikelstamm und der Lagerplatz ist direkt gelb als belegt markiert.
+      </p>
     </div>"""
+
     return page(html,"warehouse")
 
 
