@@ -1393,7 +1393,8 @@ def camera_scan():
     <h1 class="page-title">Ladungsträger & Lagerplatz per Foto</h1>
 
     <div class="notice">
-      <b>Erkannt werden:</b> Ladungsträgernummer, Artikelnummer, Artikelbezeichnung und Lagerplatz.
+      <b>Für eure Etiketten angepasst:</b> <code>LD…</code> = Artikelnummer, numerischer Barcode = Ladungsträgernummer,
+      „Bezeichnung“ = Artikelname, „Menge“ = Stückzahl und <code>HRL;22;3;37</code> = Lagerplatz <code>22/3/37</code>.
       <br><span class="muted">Artikelnummer, Artikelbezeichnung und Lagerplatz werden automatisch in die Felder übernommen. Fehlende Artikel werden nach der Bestätigung automatisch im Artikelstamm angelegt.</span>
     </div>
 
@@ -1420,6 +1421,9 @@ def camera_scan():
         <div class="camera-result">Artikelbezeichnung
           <input class="scan-input" id="articleNameValue" placeholder="Artikelname">
         </div>
+        <div class="camera-result">Menge auf Ladungsträger
+          <input class="scan-input" id="quantityValue" type="number" min="0" placeholder="z. B. 10">
+        </div>
       </div>
 
       <div class="camera-card">
@@ -1444,6 +1448,7 @@ def camera_scan():
         <input type="hidden" name="carrier_no" id="carrierHidden">
         <input type="hidden" name="article_no" id="articleNoHidden">
         <input type="hidden" name="article_name" id="articleNameHidden">
+        <input type="hidden" name="quantity" id="quantityHidden">
         <input type="hidden" name="slot_code" id="slotHidden">
         <button type="submit">Erkannte Daten automatisch übernehmen</button>
       </form>
@@ -1452,36 +1457,79 @@ def camera_scan():
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <script>
     function cleanLine(s){return (s||"").replace(/\s+/g," ").trim();}
+
+    // Lagerplatzschild bei euch z. B. "HH · HRL;22;3;37".
+    // Daraus wird automatisch unser internes Format "22/3/37".
     function extractSlot(text){
-      const m=text.match(/\b([1-9]|[12][0-9]|30)\s*[\/\-]\s*([1-4])\s*[\/\-]\s*([1-9]|[1-7][0-9]|8[0-3])\b/);
+      let m=text.match(/HRL\s*[:;,\-]?\s*([1-9]|[12][0-9]|30)\s*[;\/\-]\s*([1-4])\s*[;\/\-]\s*([1-9]|[1-7][0-9]|8[0-3])/i);
+      if(!m) m=text.match(/\b([1-9]|[12][0-9]|30)\s*[;\/\-]\s*([1-4])\s*[;\/\-]\s*([1-9]|[1-7][0-9]|8[0-3])\b/);
       return m?`${m[1]}/${m[2]}/${m[3]}`:"";
     }
+
+    // Eure echten Etiketten:
+    // Artikelnummer: Code im Format LD......, z. B. LD660807
+    // Ladungsträger: rein numerischer Code, z. B. 735100200
+    function extractArticleNo(text){
+      const compact=(text||"").replace(/\s+/g,"");
+      let m=compact.match(/\bLD[A-Z0-9]{5,12}\b/i);
+      if(m) return m[0].toUpperCase();
+      const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
+      for(const line of lines){
+        if(/artikel(?:nummer|nr\.?| no\.?)|article(?: number| no\.?)/i.test(line)){
+          const p=line.split(/[:#]/);
+          if(p.length>1) return cleanLine(p.slice(1).join(":")).replace(/\s+/g,"");
+        }
+      }
+      return "";
+    }
+
     function extractCarrier(text){
       const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
       for(const line of lines){
         if(/ladungstr[aä]ger|tr[aä]ger|load.?carrier/i.test(line)){
-          const p=line.split(/[:#]/); if(p.length>1) return cleanLine(p.slice(1).join(":"));
+          const p=line.split(/[:#]/);
+          if(p.length>1) return cleanLine(p.slice(1).join(":")).replace(/\s+/g,"");
         }
       }
-      const m=text.match(/\b(?:LT|LGT|TR)[A-Z0-9\-]{3,}\b/i); return m?m[0]:"";
+      // 8-12 stellige reine Zahl; LD-Code wird vorher als Artikelnummer erkannt.
+      const compact=(text||"").replace(/[^\d\n]/g," ");
+      const nums=compact.match(/\b\d{8,12}\b/g)||[];
+      return nums.length ? nums[nums.length-1] : "";
     }
-    function extractArticleNo(text){
-      const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
-      for(const line of lines){
-        if(/artikel(?:nummer|nr\.?| no\.?)|article(?: number| no\.?)/i.test(line)){
-          const p=line.split(/[:#]/); if(p.length>1) return cleanLine(p.slice(1).join(":"));
-        }
-      }
-      return "";
-    }
+
     function extractArticleName(text){
       const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
-      for(const line of lines){
-        if(/artikel(?:bezeichnung|name)|bezeichnung|description|article name/i.test(line)){
-          const p=line.split(/[:#]/); if(p.length>1) return cleanLine(p.slice(1).join(":"));
+      for(let i=0;i<lines.length;i++){
+        if(/^Bezeichnung\s*:?$/i.test(lines[i])){
+          // Auf euren Labels kann "Bezeichnung:" zweimal vorkommen.
+          for(let j=i+1;j<Math.min(lines.length,i+4);j++){
+            if(!/^Bezeichnung\s*:?$/i.test(lines[j]) && !/^Menge\s*:/i.test(lines[j])){
+              return lines[j];
+            }
+          }
+        }
+        if(/^Bezeichnung\s*:/i.test(lines[i])){
+          const value=cleanLine(lines[i].replace(/^Bezeichnung\s*:/i,""));
+          if(value) return value;
         }
       }
       return "";
+    }
+
+    function extractQuantity(text){
+      const m=(text||"").match(/Menge\s*:\s*([0-9]+(?:[.,][0-9]+)?)/i);
+      if(!m) return "";
+      return String(Math.round(parseFloat(m[1].replace(",","."))));
+    }
+
+    async function tryBarcodeDetector(file){
+      if(!("BarcodeDetector" in window)) return [];
+      try{
+        const img=await createImageBitmap(file);
+        const detector=new BarcodeDetector({formats:["code_128","code_39","ean_13","ean_8","itf"]});
+        const found=await detector.detect(img);
+        return found.map(x=>(x.rawValue||"").trim()).filter(Boolean);
+      }catch(e){ return []; }
     }
     async function runOCR(file,target){
       if(!file)return;
@@ -1490,34 +1538,63 @@ def camera_scan():
       preview.src=URL.createObjectURL(file); preview.style.display="block";
       status.textContent="Foto wird gelesen …";
       try{
+        let barcodeValues=[];
+        if(target==="carrier"){
+          barcodeValues=await tryBarcodeDetector(file);
+          // Direkte Barcodes zuerst: LD... = Artikelnummer, reine Zahl = Ladungsträger.
+          for(const rawCode of barcodeValues){
+            const code=rawCode.replace(/\*/g,"").replace(/\s+/g,"").trim();
+            if(/^LD[A-Z0-9]{5,12}$/i.test(code)){
+              document.getElementById("articleNoValue").value=code.toUpperCase();
+            }else if(/^\d{8,12}$/.test(code)){
+              document.getElementById("carrierValue").value=code;
+            }
+          }
+        }
+
         const result=await Tesseract.recognize(file,"deu+eng",{logger:m=>{
           if(m.status==="recognizing text") status.textContent=`Text wird erkannt … ${Math.round((m.progress||0)*100)} %`;
         }});
         const raw=result.data.text||"";
+
         if(target==="carrier"){
-          const carrier=extractCarrier(raw), ano=extractArticleNo(raw), aname=extractArticleName(raw);
-          if(carrier)document.getElementById("carrierValue").value=carrier;
-          if(ano)document.getElementById("articleNoValue").value=ano;
-          if(aname)document.getElementById("articleNameValue").value=aname;
-          status.textContent=(carrier||ano||aname)?"Erkennung abgeschlossen – Felder wurden automatisch gefüllt.":"Nicht sicher erkannt – bitte manuell korrigieren.";
+          const carrier=extractCarrier(raw);
+          const ano=extractArticleNo(raw);
+          const aname=extractArticleName(raw);
+          const qty=extractQuantity(raw);
+
+          if(!document.getElementById("carrierValue").value && carrier) document.getElementById("carrierValue").value=carrier;
+          if(!document.getElementById("articleNoValue").value && ano) document.getElementById("articleNoValue").value=ano;
+          if(aname) document.getElementById("articleNameValue").value=aname;
+          if(qty) document.getElementById("quantityValue").value=qty;
+
+          const any=document.getElementById("carrierValue").value || document.getElementById("articleNoValue").value || aname || qty;
+          status.textContent=any
+            ? "Barcode/Text erkannt – Artikel, Ladungsträger, Bezeichnung und Menge wurden automatisch eingetragen."
+            : "Nicht sicher erkannt – bitte Foto näher und gerade aufnehmen.";
         }else{
           const slot=extractSlot(raw);
-          if(slot)document.getElementById("slotValue").value=slot;
-          status.textContent=slot?"Lagerplatz erkannt und automatisch eingefügt.":"Lagerplatz nicht sicher erkannt.";
+          if(slot) document.getElementById("slotValue").value=slot;
+          status.textContent=slot
+            ? `Lagerplatz ${slot} erkannt und automatisch eingefügt.`
+            : "Lagerplatz nicht sicher erkannt. Bitte Schild frontal fotografieren.";
         }
-      }catch(e){status.textContent="Erkennung fehlgeschlagen. Bitte erneut fotografieren oder manuell eintragen.";}
+      }catch(e){
+        status.textContent="Erkennung fehlgeschlagen. Bitte erneut fotografieren oder manuell eintragen.";
+      }
     }
     document.getElementById("carrierPhoto").addEventListener("change",e=>runOCR(e.target.files[0],"carrier"));
     document.getElementById("slotPhoto").addEventListener("change",e=>runOCR(e.target.files[0],"slot"));
     function resetCarrier(){
       carrierPhoto.value="";carrierPreview.style.display="none";carrierStatus.textContent="Noch kein Foto.";
-      carrierValue.value="";articleNoValue.value="";articleNameValue.value="";
+      carrierValue.value="";articleNoValue.value="";articleNameValue.value="";quantityValue.value="";
     }
     function resetSlot(){slotPhoto.value="";slotPreview.style.display="none";slotStatus.textContent="Noch kein Foto.";slotValue.value="";}
     function fillHidden(){
       carrierHidden.value=carrierValue.value.trim();
       articleNoHidden.value=articleNoValue.value.trim();
       articleNameHidden.value=articleNameValue.value.trim();
+      quantityHidden.value=quantityValue.value.trim();
       slotHidden.value=slotValue.value.trim();
       if(!carrierHidden.value||!slotHidden.value){alert("Ladungsträger und Lagerplatz müssen vorhanden sein.");return false;}
       return true;
@@ -1532,6 +1609,10 @@ def camera_confirm():
     carrier_no=request.form.get("carrier_no","").strip()
     article_no=request.form.get("article_no","").strip()
     article_name=request.form.get("article_name","").strip()
+    try:
+        quantity=max(0,int(float((request.form.get("quantity","0") or "0").replace(",","."))))
+    except Exception:
+        quantity=0
     slot_code=request.form.get("slot_code","").strip()
 
     warnings=[]
@@ -1564,7 +1645,7 @@ def camera_confirm():
                      VALUES(?,?,?,?,?,?,?)""",
                   (carrier_no,article_no or None,
                    (article["article_name"] if article else article_name) or None,
-                   0,(article["pallet_type"] if article else "Euro"),
+                   quantity,(article["pallet_type"] if article else "Euro"),
                    "offen",datetime.now().isoformat(timespec="minutes")))
         c.commit()
         lt=c.execute("SELECT * FROM load_carriers WHERE carrier_no=?",(carrier_no,)).fetchone()
@@ -1574,14 +1655,20 @@ def camera_confirm():
         if lt["article_no"] and lt["article_no"] != article_no:
             warnings.append(f'ACHTUNG: Ladungsträger ist bereits Artikel {lt["article_no"]} zugeordnet; Foto erkennt {article_no}. Keine automatische Änderung.')
         elif not lt["article_no"]:
-            c.execute("""UPDATE load_carriers SET article_no=?,article_name=?,pallet_type=? WHERE id=?""",
+            c.execute("""UPDATE load_carriers SET article_no=?,article_name=?,pallet_type=?,quantity=? WHERE id=?""",
                       (article_no,
                        (article["article_name"] if article else article_name),
                        (article["pallet_type"] if article else lt["pallet_type"]),
+                       quantity if quantity else lt["quantity"],
                        lt["id"]))
             c.commit()
             lt=c.execute("SELECT * FROM load_carriers WHERE id=?",(lt["id"],)).fetchone()
             actions.append("Erkannter Artikel wurde dem Ladungsträger automatisch zugeordnet.")
+        elif lt["article_no"] == article_no and quantity and quantity != lt["quantity"]:
+            c.execute("UPDATE load_carriers SET quantity=? WHERE id=?",(quantity,lt["id"]))
+            c.commit()
+            lt=c.execute("SELECT * FROM load_carriers WHERE id=?",(lt["id"],)).fetchone()
+            actions.append(f"Erkannte Menge {quantity} wurde automatisch am Ladungsträger übernommen.")
 
     parsed=parse_slot(slot_code)
     slot=None
@@ -1610,6 +1697,7 @@ def camera_confirm():
       <tr><td>Ladungsträger</td><td><b>{carrier_no or "–"}</b></td></tr>
       <tr><td>Artikelnummer</td><td><b>{article_no or "–"}</b></td></tr>
       <tr><td>Artikel</td><td>{(article["article_name"] if article else article_name) or "–"}</td></tr>
+      <tr><td>Menge</td><td><b>{quantity}</b></td></tr>
       <tr><td>Lagerplatz</td><td><b>{slot_code or "–"}</b></td></tr>
     </table></div>
     """
