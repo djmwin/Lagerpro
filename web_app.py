@@ -77,7 +77,21 @@ def init_db():
         if name not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
 
+    # V24: Kompatibilitaet mit alten Railway-Datenbanken.
+    # Aeltere Versionen verwenden "name", neuere Funktionen "article_name".
+    # Wir behalten beide Felder und synchronisieren vorhandene Werte.
+    add_col("articles", "article_name TEXT")
     add_col("articles", "units_per_carton INTEGER NOT NULL DEFAULT 1")
+    c.execute("""
+        UPDATE articles
+        SET article_name = COALESCE(NULLIF(article_name,''), name)
+        WHERE article_name IS NULL OR article_name=''
+    """)
+    c.execute("""
+        UPDATE articles
+        SET name = COALESCE(NULLIF(name,''), article_name, article_no)
+        WHERE name IS NULL OR name=''
+    """)
     add_col("items", "units_per_carton INTEGER NOT NULL DEFAULT 1")
     add_col("items", "article_count INTEGER NOT NULL DEFAULT 0")
     add_col("warehouse_slots", "load_carrier_no TEXT")
@@ -1631,7 +1645,10 @@ def camera_confirm():
     # Article recognition is now productive: create article master automatically if missing.
     article=None
     if article_no:
-        article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone()
+        article=c.execute("""
+            SELECT *, COALESCE(NULLIF(article_name,''), name, article_no) AS booking_article_name
+            FROM articles WHERE article_no=?
+        """,(article_no,)).fetchone()
         if not article:
             safe_name=article_name or f"Artikel {article_no}"
             c.execute("""INSERT INTO articles(article_no,article_name,pallet_type,storage_rule,units_per_carton)
@@ -1780,14 +1797,14 @@ def manual_booking():
 
                     c.execute(
                         "INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,closed_at,stored_at,quality_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (carrier_no,article["article_no"],article["article_name"],quantity,
+                        (carrier_no,article["article_no"],article["booking_article_name"],quantity,
                          article["pallet_type"],"eingelagert",r,l,p,now,now,now,"frei")
                     )
                     lid=c.lastrowid
 
                     c.execute(
                         "UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?,slot_status='belegt' WHERE rack=? AND level=? AND position=?",
-                        (article["article_no"],article["article_name"],article["pallet_type"],quantity,
+                        (article["article_no"],article["booking_article_name"],article["pallet_type"],quantity,
                          now,carrier_no,lid,r,l,p)
                     )
 
@@ -1797,10 +1814,13 @@ def manual_booking():
                     )
 
                     c.commit()
-                    msg=f'{article["article_no"]} - {article["article_name"]} wurde mit Menge {quantity} auf {slot_code} gebucht.'
+                    msg=f'{article["article_no"]} - {article["booking_article_name"]} wurde mit Menge {quantity} auf {slot_code} gebucht.'
                     success=True
 
-    articles=c.execute("SELECT article_no,article_name FROM articles ORDER BY article_no LIMIT 500").fetchall()
+    articles=c.execute("""
+        SELECT article_no, COALESCE(NULLIF(article_name,''), name, article_no) AS article_name
+        FROM articles ORDER BY article_no LIMIT 500
+    """).fetchall()
     c.close()
 
     html="""<div class="kicker">MANUELLE DIREKTBUCHUNG</div>
