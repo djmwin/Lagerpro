@@ -2537,21 +2537,19 @@ def audit(action, entity_type="", entity_id="", before=None, after=None, note=""
         pass
 
 def role_allowed(*roles):
-    return session.get('role') in roles
+    # V35 Entwicklungsmodus: Rechtepruefung voruebergehend deaktiviert.
+    # Benutzerverwaltung bleibt fuer die spaetere Firmenversion im Code erhalten.
+    return True
 
 @app.before_request
 def security_gate():
-    if request.endpoint in {'login','setup_admin','health','manifest','service_worker','static'}:
-        return
-    c=con(); count=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]; c.close()
-    if count==0: return redirect('/setup')
-    if not session.get('user_id'): return redirect('/login?next='+request.path)
-    last=session.get('last_seen')
-    if last:
-        try:
-            if datetime.now()-datetime.fromisoformat(last)>timedelta(hours=8): session.clear(); return redirect('/login')
-        except Exception: pass
-    session['last_seen']=now_iso()
+    # V35 ENTWICKLUNGSMODUS: keine Anmeldung erforderlich.
+    # Virtueller Admin sorgt dafuer, dass alle Entwicklungsfunktionen sichtbar sind.
+    session.setdefault('user_id', 0)
+    session.setdefault('username', 'Entwicklung')
+    session.setdefault('role', 'Admin')
+    session['last_seen'] = now_iso()
+    return None
 
 @app.route('/setup',methods=['GET','POST'])
 def setup_admin():
@@ -2582,7 +2580,8 @@ def login():
 
 @app.route('/logout')
 def logout():
-    audit('Logout','user',session.get('user_id')); session.clear(); return redirect('/login')
+    # Im Entwicklungsmodus gibt es keine aktive Anmeldung.
+    return redirect('/')
 
 @app.route('/users',methods=['GET','POST'])
 def users_page():
@@ -2593,14 +2592,13 @@ def users_page():
             u=request.form['username'].strip(); role=request.form.get('role','Mitarbeiter'); c.execute("INSERT INTO users(username,password_hash,full_name,role,created_at) VALUES(?,?,?,?,?)",(u,generate_password_hash(request.form['password']),request.form.get('full_name',u),role,now_iso())); c.commit(); audit('Benutzer angelegt','user',u,after={'role':role}); msg='Benutzer angelegt.'
         except Exception as e: msg=str(e)
     rows=c.execute("SELECT * FROM users ORDER BY username").fetchall(); c.close(); trs=''.join(f"<tr><td>{r['username']}</td><td>{r['full_name']}</td><td>{r['role']}</td><td>{'aktiv' if r['active'] else 'inaktiv'}</td></tr>" for r in rows)
-    return page(f'<div class="kicker">ADMIN · ZUGANGSVERWALTUNG</div><h1 class="page-title">Benutzer hinzufügen</h1><div class="notice">Ohne Anmeldung sehen Benutzer ausschließlich die Login-Seite. Nach erfolgreicher Anmeldung erhalten sie Zugriff entsprechend ihrer Rolle. Nur Administratoren können diesen Bereich öffnen.</div><div class="card"><h2>Neuen Benutzer anlegen</h2><p>{msg}</p><form method="post"><div class="row"><input name="full_name" placeholder="Name" required><input name="username" placeholder="Benutzername" required></div><div class="row"><input type="password" name="password" minlength="8" placeholder="Startpasswort" required><select name="role"><option>Mitarbeiter</option><option>Lagerleitung</option><option>Admin</option></select></div><button>Benutzer hinzufügen</button></form></div><div class="card"><h2>Vorhandene Benutzer</h2><table><tr><th>Benutzer</th><th>Name</th><th>Rolle</th><th>Status</th></tr>{trs}</table></div>','users')
+    return page(f'<div class="kicker">ADMIN · ZUGANGSVERWALTUNG</div><h1 class="page-title">Benutzer hinzufügen</h1><div class="notice">Entwicklungsmodus aktiv: Die Anmeldung ist vorübergehend deaktiviert. Die Benutzerverwaltung bleibt erhalten und kann später für die Firmenversion wieder aktiviert werden.</div><div class="card"><h2>Neuen Benutzer anlegen</h2><p>{msg}</p><form method="post"><div class="row"><input name="full_name" placeholder="Name" required><input name="username" placeholder="Benutzername" required></div><div class="row"><input type="password" name="password" minlength="8" placeholder="Startpasswort" required><select name="role"><option>Mitarbeiter</option><option>Lagerleitung</option><option>Admin</option></select></div><button>Benutzer hinzufügen</button></form></div><div class="card"><h2>Vorhandene Benutzer</h2><table><tr><th>Benutzer</th><th>Name</th><th>Rolle</th><th>Status</th></tr>{trs}</table></div>','users')
 
 @app.route('/more')
 def more_page():
     links=[('/stock','Bestände'),('/purchasing','Einkauf / Nachbestellen'),('/reports','Ein-/Auslagerungsbilanz'),('/batch-booking','Mehrfach-Einlagerung'),('/reservations','Reservierungen'),('/optimizer','Optimierungsassistent'),('/simulation','Lager-Simulation'),('/handover','Schichtübergabe'),('/notifications','Frühwarnsystem')]
     if role_allowed('Admin'):
         links += [('/audit','Audit-Historie'),('/backup','Backups'),('/settings','Einstellungen'),('/users','Benutzerverwaltung')]
-    links.append(('/logout','Abmelden'))
     cards=''.join(f'<a class="action-card" href="{u}"><b>{t}</b><span class="muted">Öffnen</span></a>' for u,t in links)
     return page(f'<div class="kicker">ERWEITERUNGEN</div><h1 class="page-title">LagerPro Complete</h1><div class="action-grid">{cards}</div>','more')
 
