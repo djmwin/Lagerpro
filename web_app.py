@@ -45,7 +45,31 @@ def init_db():
         cpp INTEGER NOT NULL,
         pallet_type TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS warehouse_slots(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rack INTEGER NOT NULL,
+        level INTEGER NOT NULL,
+        position INTEGER NOT NULL,
+        article_no TEXT,
+        article_name TEXT,
+        pallet_type TEXT,
+        quantity INTEGER,
+        container_id INTEGER,
+        occupied_at TEXT,
+        UNIQUE(rack, level, position)
+    );
     """)
+
+    for rack in range(1, 31):
+        for level in range(1, 5):
+            for position in range(1, 84):
+                c.execute(
+                    """INSERT OR IGNORE INTO warehouse_slots(rack,level,position)
+                       VALUES(?,?,?)""",
+                    (rack, level, position)
+                )
+
     c.commit()
     c.close()
 
@@ -205,6 +229,31 @@ th{color:#aebed3}
 .bottom-nav a.active{
   color:var(--yellow);border-bottom:3px solid var(--yellow)
 }
+
+.warehouse-toolbar{
+  display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px
+}
+.slot-grid{
+  display:grid;grid-template-columns:repeat(12,minmax(74px,1fr));
+  gap:7px;overflow-x:auto;padding-bottom:5px
+}
+.slot{
+  min-height:76px;border:1px solid #294766;border-radius:12px;
+  padding:8px;background:#0a1727;color:white;text-decoration:none;
+  display:flex;flex-direction:column;justify-content:space-between
+}
+.slot.free{border-color:#28415f;background:#091522}
+.slot.occupied{border-color:#2f8f59;background:#0b271b}
+.slot .slot-code{font-weight:900;font-size:13px}
+.slot .slot-info{font-size:11px;color:#c2d0e2;line-height:1.2}
+.slot .slot-state{font-size:10px;font-weight:900;letter-spacing:.5px}
+.slot.free .slot-state{color:#7f94af}
+.slot.occupied .slot-state{color:var(--green)}
+@media(max-width:760px){
+  .slot-grid{grid-template-columns:repeat(6,minmax(74px,1fr))}
+  .warehouse-toolbar{grid-template-columns:1fr 1fr}
+}
+
 @media(max-width:760px){
   .logo-wrap img{height:48px}
   .datetime{display:none}
@@ -231,6 +280,7 @@ def bottom_nav(active):
         ("/","⌂","Dashboard","dashboard"),
         ("/articles","◈","Artikel","articles"),
         ("/containers","▣","Container","containers"),
+        ("/warehouse","▦","Lager","warehouse"),
         ("/gates","▥","Tore","gates"),
     ]
     html = '<div class="bottom-nav">'
@@ -272,11 +322,12 @@ def dashboard():
     containers = c.execute(
         "SELECT * FROM containers WHERE status!='erledigt' ORDER BY id DESC"
     ).fetchall()
-    items = c.execute("SELECT * FROM items").fetchall()
+    total_places = c.execute("SELECT COUNT(*) FROM warehouse_slots").fetchone()[0]
+    occupied = c.execute(
+        "SELECT COUNT(*) FROM warehouse_slots WHERE article_no IS NOT NULL"
+    ).fetchone()[0]
     c.close()
 
-    total_places = 332
-    occupied = min(sum(calc(x["cartons"], x["cpp"])[2] for x in items), total_places)
     free = total_places - occupied
     percent = round(occupied / total_places * 100) if total_places else 0
 
@@ -298,7 +349,7 @@ def dashboard():
       <div class="card">
         <div class="card-title">Gesamtstellplätze</div>
         <div class="number">{total_places}</div>
-        <div class="muted">4 Ebenen × 83 Stellplätze</div>
+        <div class="muted">30 Regale × 4 Ebenen × 83 Plätze</div>
       </div>
 
       <div class="card">
@@ -653,6 +704,229 @@ def container_detail(cid):
 
     html += f"</table><h3>Benötigte Stellplätze: {total}</h3></div>"
     return page(html, "containers")
+
+
+@app.route("/warehouse")
+def warehouse():
+    try:
+        rack = int(request.args.get("rack", 1))
+    except ValueError:
+        rack = 1
+    try:
+        level = int(request.args.get("level", 1))
+    except ValueError:
+        level = 1
+
+    rack = min(30, max(1, rack))
+    level = min(4, max(1, level))
+
+    c = con()
+    slots = c.execute(
+        """SELECT * FROM warehouse_slots
+           WHERE rack=? AND level=?
+           ORDER BY position""",
+        (rack, level)
+    ).fetchall()
+
+    occupied = c.execute(
+        """SELECT COUNT(*) FROM warehouse_slots
+           WHERE rack=? AND level=? AND article_no IS NOT NULL""",
+        (rack, level)
+    ).fetchone()[0]
+    c.close()
+
+    free = 83 - occupied
+
+    rack_options = "".join(
+        f'<option value="{r}" {"selected" if r == rack else ""}>Regal {r}</option>'
+        for r in range(1, 31)
+    )
+    level_options = "".join(
+        f'<option value="{l}" {"selected" if l == level else ""}>Ebene {l}</option>'
+        for l in range(1, 5)
+    )
+
+    html = f"""
+    <div class="kicker">LAGER</div>
+    <h1 class="page-title">Lagerübersicht</h1>
+
+    <div class="card">
+      <form method="get" class="warehouse-toolbar">
+        <div>
+          Regal
+          <select name="rack" onchange="this.form.submit()">
+            {rack_options}
+          </select>
+        </div>
+        <div>
+          Ebene
+          <select name="level" onchange="this.form.submit()">
+            {level_options}
+          </select>
+        </div>
+      </form>
+
+      <div class="row">
+        <div>
+          <div class="card-title">Belegt auf dieser Ebene</div>
+          <div class="number">{occupied}</div>
+        </div>
+        <div>
+          <div class="card-title">Frei auf dieser Ebene</div>
+          <div class="number">{free}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-head">
+        <h2>Regal {rack} · Ebene {level}</h2>
+        <span class="muted">83 Stellplätze</span>
+      </div>
+      <div class="slot-grid">
+    """
+
+    for slot in slots:
+        code = f'{slot["rack"]}/{slot["level"]}/{slot["position"]}'
+        if slot["article_no"]:
+            html += f"""
+            <a class="slot occupied" href="/warehouse/slot/{slot["rack"]}/{slot["level"]}/{slot["position"]}">
+              <div class="slot-code">{code}</div>
+              <div class="slot-info">
+                {slot["article_no"]}<br>
+                {slot["article_name"] or ""}
+              </div>
+              <div class="slot-state">BELEGT</div>
+            </a>
+            """
+        else:
+            html += f"""
+            <a class="slot free" href="/warehouse/slot/{slot["rack"]}/{slot["level"]}/{slot["position"]}">
+              <div class="slot-code">{code}</div>
+              <div class="slot-info">Freier Lagerplatz</div>
+              <div class="slot-state">FREI</div>
+            </a>
+            """
+
+    html += "</div></div>"
+    return page(html, "warehouse")
+
+
+@app.route("/warehouse/slot/<int:rack>/<int:level>/<int:position>", methods=["GET", "POST"])
+def warehouse_slot(rack, level, position):
+    if not (1 <= rack <= 30 and 1 <= level <= 4 and 1 <= position <= 83):
+        return redirect("/warehouse")
+
+    c = con()
+    slot = c.execute(
+        """SELECT * FROM warehouse_slots
+           WHERE rack=? AND level=? AND position=?""",
+        (rack, level, position)
+    ).fetchone()
+
+    if not slot:
+        c.close()
+        return redirect("/warehouse")
+
+    if request.method == "POST":
+        action = request.form.get("action", "assign")
+
+        if action == "clear":
+            c.execute(
+                """UPDATE warehouse_slots
+                   SET article_no=NULL, article_name=NULL, pallet_type=NULL,
+                       quantity=NULL, container_id=NULL, occupied_at=NULL
+                   WHERE rack=? AND level=? AND position=?""",
+                (rack, level, position)
+            )
+            c.commit()
+            c.close()
+            return redirect(f"/warehouse?rack={rack}&level={level}")
+
+        article_no = request.form.get("article_no", "").strip()
+        article = c.execute(
+            "SELECT * FROM articles WHERE article_no=?",
+            (article_no,)
+        ).fetchone()
+
+        if article:
+            qty = request.form.get("quantity", "").strip()
+            qty = int(qty) if qty.isdigit() else 1
+
+            c.execute(
+                """UPDATE warehouse_slots
+                   SET article_no=?, article_name=?, pallet_type=?,
+                       quantity=?, occupied_at=?
+                   WHERE rack=? AND level=? AND position=?""",
+                (
+                    article["article_no"],
+                    article["name"],
+                    article["pallet_type"],
+                    qty,
+                    datetime.now().isoformat(timespec="minutes"),
+                    rack, level, position
+                )
+            )
+            c.commit()
+
+        c.close()
+        return redirect(f"/warehouse?rack={rack}&level={level}")
+
+    articles = c.execute("SELECT * FROM articles ORDER BY article_no").fetchall()
+    c.close()
+
+    code = f"{rack}/{level}/{position}"
+
+    html = f"""
+    <div class="kicker">LAGERPLATZ</div>
+    <h1 class="page-title">{code}</h1>
+
+    <div class="card">
+    """
+
+    if slot["article_no"]:
+        html += f"""
+        <h2>Belegt</h2>
+        <p><b>Artikel:</b> {slot["article_no"]} – {slot["article_name"] or ""}</p>
+        <p><b>Palettentyp:</b> {slot["pallet_type"] or "–"}</p>
+        <p><b>Menge:</b> {slot["quantity"] or 1}</p>
+        <form method="post">
+          <input type="hidden" name="action" value="clear">
+          <button type="submit">Lagerplatz freigeben</button>
+        </form>
+        """
+    else:
+        html += """
+        <h2>Freier Lagerplatz</h2>
+        """
+
+        if articles:
+            html += '<form method="post"><input type="hidden" name="action" value="assign">Artikel<select name="article_no">'
+            for article in articles:
+                html += (
+                    f'<option value="{article["article_no"]}">'
+                    f'{article["article_no"]} – {article["name"]} · {article["pallet_type"]}'
+                    f'</option>'
+                )
+            html += """
+            </select>
+            Menge / Paletteneinheit
+            <input type="number" name="quantity" min="1" value="1">
+            <button type="submit">Auf Lagerplatz einlagern</button>
+            </form>
+            """
+        else:
+            html += '<p class="muted">Bitte zuerst einen Artikel anlegen.</p>'
+
+    html += f"""
+      <p style="margin-top:18px">
+        <a class="yellow-link" href="/warehouse?rack={rack}&level={level}">← Zurück zu Regal {rack}, Ebene {level}</a>
+      </p>
+    </div>
+    """
+
+    return page(html, "warehouse")
+
 
 @app.route("/gates")
 def gates():
