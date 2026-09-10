@@ -126,6 +126,81 @@ def init_db():
         WHERE COALESCE(article_count,0)=0
     """)
 
+    # V18: Leitstand, Qualität, Sperrplätze, Aufträge, Inventur und Sage-Sync-Vorbereitung
+    add_col("warehouse_slots", "slot_status TEXT NOT NULL DEFAULT 'frei'")
+    add_col("warehouse_slots", "block_reason TEXT")
+    add_col("load_carriers", "quality_status TEXT NOT NULL DEFAULT 'frei'")
+    add_col("load_carriers", "quality_note TEXT")
+    add_col("containers", "planned_arrival TEXT")
+    add_col("containers", "arrival_at TEXT")
+    add_col("containers", "unload_started_at TEXT")
+    add_col("containers", "unload_finished_at TEXT")
+    add_col("containers", "departed_at TEXT")
+    add_col("containers", "carrier_name TEXT")
+    add_col("containers", "truck_plate TEXT")
+    add_col("containers", "seal_no TEXT")
+    add_col("containers", "delivery_note TEXT")
+    add_col("containers", "issue_note TEXT")
+
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS inbound_checks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        container_id INTEGER NOT NULL,
+        article_no TEXT NOT NULL,
+        expected_cartons INTEGER NOT NULL DEFAULT 0,
+        received_cartons INTEGER NOT NULL DEFAULT 0,
+        damaged_units INTEGER NOT NULL DEFAULT 0,
+        missing_units INTEGER NOT NULL DEFAULT 0,
+        note TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        task_type TEXT NOT NULL DEFAULT 'Allgemein',
+        priority TEXT NOT NULL DEFAULT 'Normal',
+        carrier_no TEXT,
+        from_slot TEXT,
+        to_slot TEXT,
+        note TEXT,
+        status TEXT NOT NULL DEFAULT 'offen',
+        created_at TEXT NOT NULL,
+        completed_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS inventory_checks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_code TEXT NOT NULL,
+        expected_carrier TEXT,
+        scanned_carrier TEXT,
+        result TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sage_sync_queue(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        payload TEXT,
+        status TEXT NOT NULL DEFAULT 'wartet',
+        error_text TEXT,
+        created_at TEXT NOT NULL,
+        synced_at TEXT
+    );
+    """)
+
+    c.execute("""
+        UPDATE warehouse_slots
+        SET slot_status = CASE
+            WHEN COALESCE(slot_status,'')='gesperrt' THEN 'gesperrt'
+            WHEN load_carrier_id IS NOT NULL THEN 'belegt'
+            ELSE 'frei'
+        END
+    """)
+
     c.commit()
     c.close()
 
@@ -349,6 +424,27 @@ th{color:#aebed3}
   .row{grid-template-columns:1fr}
   table{display:block;overflow-x:auto}
 }
+
+.slot.blocked{border-color:#b74b4b;background:#2a1016}
+.slot.blocked .slot-state{color:#ff7070}
+.slot.quarantine{border-color:#e0a500;background:#2b230b}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:999px;border:1px solid #28415f;background:#091522;font-size:12px;font-weight:800}
+.pill.green{border-color:#25814d;color:#57ec8e}
+.pill.yellow{border-color:#9a7a00;color:#ffdc3a}
+.pill.red{border-color:#903d3d;color:#ff7777}
+.leit-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+.leit-gate{background:#0a1727;border:1px solid #294766;border-radius:16px;padding:14px;min-height:180px}
+.big-status{font-size:24px;font-weight:900;margin:8px 0}
+.metric-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+.metric{background:#091827;border:1px solid #203a5b;border-radius:14px;padding:12px}
+.metric strong{display:block;font-size:26px;margin-top:5px}
+.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+.toolbar a{display:inline-block;text-decoration:none}
+.small-btn{padding:9px 12px;border-radius:10px;background:#173352;color:white;border:1px solid #315a83}
+.notice{padding:12px;border:1px solid #355675;border-radius:12px;background:#0a1727;margin:10px 0}
+@media(max-width:900px){.leit-grid{grid-template-columns:repeat(2,1fr)}.metric-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:560px){.leit-grid,.metric-grid{grid-template-columns:1fr}}
+
 </style>
 """
 
@@ -375,6 +471,8 @@ def page(content, active="dashboard"):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#07111f">
+<link rel="manifest" href="/manifest.webmanifest">
 <title>Lagerprozess</title>
 {STYLE}
 </head>
@@ -392,6 +490,9 @@ def page(content, active="dashboard"):
 </header>
 <main class="main">{content}</main>
 {bottom_nav(active)}
+<script>
+if ("serviceWorker" in navigator) {{ navigator.serviceWorker.register("/sw.js").catch(()=>{{}}); }}
+</script>
 </body>
 </html>"""
 
@@ -405,9 +506,13 @@ def dashboard():
     occupied = c.execute(
         "SELECT COUNT(*) FROM warehouse_slots WHERE load_carrier_id IS NOT NULL"
     ).fetchone()[0]
+    blocked = c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE slot_status='gesperrt'").fetchone()[0]
+    open_tasks = c.execute("SELECT COUNT(*) FROM tasks WHERE status='offen'").fetchone()[0]
+    quarantine = c.execute("SELECT COUNT(*) FROM load_carriers WHERE quality_status='quarantaene'").fetchone()[0]
+    sync_waiting = c.execute("SELECT COUNT(*) FROM sage_sync_queue WHERE status IN ('wartet','fehler')").fetchone()[0]
     c.close()
 
-    free = total_places - occupied
+    free = max(0, total_places - occupied - blocked)
     percent = round(occupied / total_places * 100) if total_places else 0
 
     gates = {g: None for g in range(8, 13)}
@@ -422,6 +527,12 @@ def dashboard():
         <h1>Lagerprozess</h1>
         <p>Übersicht · Kontrolle · Effiziente Lagerhaltung</p>
       </div>
+    </section>
+
+    <section class="action-grid">
+      <a class="action-card" href="/control"><b>▦ Wareneingangs-Leitstand</b><span class="muted">Tore 8–12 · Fortschritt · Probleme</span></a>
+      <a class="action-card" href="/store"><b>⌁ Scan-Einlagerung</b><span class="muted">Ladungsträger + Lagerplatz</span></a>
+      <a class="action-card" href="/search"><b>⌕ Wo ist meine Ware?</b><span class="muted">Artikel · Seriennummer · Ladungsträger</span></a>
     </section>
 
     <section class="cards">
@@ -448,6 +559,23 @@ def dashboard():
         <div class="card-title">Aktive Container</div>
         <div class="number">{len(containers)}</div>
         <div class="muted">Tore 8–12</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head"><h2>Betriebsstatus</h2><a class="yellow-link" href="/reports">Auswertungen →</a></div>
+      <div class="metric-grid">
+        <div class="metric"><span class="muted">Gesperrte Plätze</span><strong>{blocked}</strong></div>
+        <div class="metric"><span class="muted">Offene Aufträge</span><strong>{open_tasks}</strong></div>
+        <div class="metric"><span class="muted">Quarantäne</span><strong>{quarantine}</strong></div>
+        <div class="metric"><span class="muted">Sage-Sync offen</span><strong>{sync_waiting}</strong></div>
+      </div>
+      <div class="toolbar">
+        <a class="small-btn" href="/tasks">Arbeitsaufträge</a>
+        <a class="small-btn" href="/inventory">Inventur</a>
+        <a class="small-btn" href="/quality">Qualität</a>
+        <a class="small-btn" href="/slot-admin">Sperrplätze</a>
+        <a class="small-btn" href="/sync">Sage-Sync</a>
       </div>
     </section>
 
@@ -806,6 +934,20 @@ def carrier_detail(lid):
             html += '<div class="card"><form method="post"><input type="hidden" name="action" value="close"><button>Ladungsträger abschließen</button></form></div>'
         elif not lt["rack"]:
             html += f'<div class="card"><a class="yellow-link" href="/store?carrier={lt["carrier_no"]}">Weiter zur Einlagerung →</a></div>'
+    html += f"""
+    <div class="card">
+      <h2>Qualitätsstatus</h2>
+      <form method="post" action="/carrier/{lid}/quality">
+        <select name="quality_status">
+          <option value="frei" {"selected" if lt["quality_status"]=="frei" else ""}>Frei</option>
+          <option value="quarantaene" {"selected" if lt["quality_status"]=="quarantaene" else ""}>Quarantäne</option>
+          <option value="gesperrt" {"selected" if lt["quality_status"]=="gesperrt" else ""}>Gesperrt</option>
+        </select>
+        <input name="quality_note" value="{lt["quality_note"] or ""}" placeholder="Grund / Hinweis">
+        <button>Qualitätsstatus speichern</button>
+      </form>
+    </div>
+    """
     return page(html,"carriers")
 
 
@@ -840,8 +982,12 @@ def store():
             slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
             art=c.execute("SELECT * FROM articles WHERE article_no=?",(lt["article_no"],)).fetchone()
             rule=art["storage_rule"] if art else "Alle Ebenen"
-            if slot["load_carrier_id"] and slot["load_carrier_id"] != lt["id"]:
+            if slot["slot_status"]=="gesperrt":
+                msg=f'Dieser Lagerplatz ist gesperrt: {slot["block_reason"] or "kein Grund angegeben"}.'
+            elif slot["load_carrier_id"] and slot["load_carrier_id"] != lt["id"]:
                 msg="Dieser Lagerplatz ist bereits belegt."
+            elif lt["quality_status"] in ("quarantaene","gesperrt"):
+                msg="Dieser Ladungsträger ist qualitativ gesperrt und darf nicht normal eingelagert werden."
             elif rule=="Nur Ebene 1" and l!=1:
                 msg="Dieser Artikel darf nur auf Ebene 1."
             elif rule=="Nur Ebene 2-4" and l==1:
@@ -859,11 +1005,12 @@ def store():
                     old=f'{lt["rack"]}/{lt["level"]}/{lt["position"]}' if lt["rack"] else None
                     if lt["rack"]:
                         c.execute("""UPDATE warehouse_slots SET article_no=NULL,article_name=NULL,pallet_type=NULL,
-                                     quantity=NULL,container_id=NULL,occupied_at=NULL,load_carrier_no=NULL,load_carrier_id=NULL
+                                     quantity=NULL,container_id=NULL,occupied_at=NULL,load_carrier_no=NULL,load_carrier_id=NULL,
+                                     slot_status='frei'
                                      WHERE load_carrier_id=?""",(lt["id"],))
                     now=datetime.now().isoformat(timespec="minutes")
                     c.execute("""UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,
-                                 container_id=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?
+                                 container_id=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?,slot_status='belegt'
                                  WHERE rack=? AND level=? AND position=?""",
                               (lt["article_no"],lt["article_name"],lt["pallet_type"],lt["quantity"],
                                lt["container_id"],now,lt["carrier_no"],lt["id"],r,l,p))
@@ -907,7 +1054,10 @@ def warehouse():
     <div class="card"><div class="section-head"><h2>Regal {r} · Ebene {l}</h2><span class="muted">83 Plätze</span></div><div class="slot-grid">"""
     for s in slots:
         code=f'{r}/{l}/{s["position"]}'
-        if s["load_carrier_id"]:
+        if s["slot_status"]=="gesperrt":
+            html += f"""<div class="slot blocked"><div class="slot-code">{code}</div>
+              <div class="slot-info">{s["block_reason"] or "Gesperrt"}</div><div class="slot-state">GESPERRT</div></div>"""
+        elif s["load_carrier_id"]:
             html += f"""<a class="slot occupied" href="/carrier/{s["load_carrier_id"]}">
               <div class="slot-code">{code}</div><div class="slot-info">{s["load_carrier_no"]}<br>{s["article_no"]}</div>
               <div class="slot-state">BELEGT</div></a>"""
@@ -953,6 +1103,274 @@ def archive():
         html += f'<tr><td>{m["created_at"]}</td><td>{m["carrier_no"] or "–"}</td><td>{m["movement_type"]}</td><td>{m["from_slot"] or "–"}</td><td>{m["to_slot"] or "–"}</td></tr>'
     html += "</table></div>"
     return page(html,"archive")
+
+
+
+@app.route("/control")
+def control_center():
+    c=con()
+    active=c.execute("SELECT * FROM containers WHERE status!='erledigt' ORDER BY gate_no,id DESC").fetchall()
+    gates={g:None for g in range(8,13)}
+    for x in active:
+        if x["gate_no"] in gates and gates[x["gate_no"]] is None:
+            gates[x["gate_no"]]=x
+    html='''<div class="kicker">LEITSTAND</div><h1 class="page-title">Wareneingang · Tore 8–12</h1>
+    <div class="toolbar"><a class="small-btn" href="/containers">+ Container</a><a class="small-btn" href="/tasks">Aufträge</a>
+    <a class="small-btn" href="/quality">Probleme / Quarantäne</a></div><div class="leit-grid">'''
+    for gate in range(8,13):
+        x=gates[gate]
+        if not x:
+            html += f'''<div class="leit-gate"><div class="muted">TOR</div><div class="big-status">Tor {gate}</div>
+            <span class="pill green">FREI</span><p class="muted">Kein aktiver Container</p></div>'''
+            continue
+        item_stats=c.execute("SELECT COALESCE(SUM(article_count),0) units,COALESCE(SUM(cartons),0) cartons FROM items WHERE container_id=?",(x["id"],)).fetchone()
+        carriers=c.execute("SELECT COUNT(*) total,SUM(CASE WHEN status='eingelagert' THEN 1 ELSE 0 END) stored FROM load_carriers WHERE container_id=?",(x["id"],)).fetchone()
+        total=carriers["total"] or 0
+        stored=carriers["stored"] or 0
+        progress=round(stored/total*100) if total else 0
+        cls="yellow" if x["status"]=="verspätet" else "green"
+        html += f'''<div class="leit-gate"><div class="muted">TOR {gate}</div><div class="big-status">{x["container_no"]}</div>
+        <span class="pill {cls}">{x["status"].upper()}</span>
+        <p><b>{item_stats["cartons"]}</b> Kartons · <b>{item_stats["units"]}</b> Artikel</p>
+        <p><b>{stored}/{total}</b> Ladungsträger eingelagert</p>
+        <div class="progress"><span style="width:{progress}%"></span></div>
+        <a class="yellow-link" href="/container/{x["id"]}">Container öffnen →</a><br>
+        <a class="yellow-link" href="/container/{x["id"]}/check">Wareneingang prüfen →</a></div>'''
+    c.close()
+    html += '</div>'
+    return page(html,"dashboard")
+
+
+@app.route("/container/<int:cid>/check", methods=["GET","POST"])
+def inbound_check(cid):
+    c=con()
+    cont=c.execute("SELECT * FROM containers WHERE id=?",(cid,)).fetchone()
+    if not cont:
+        c.close(); return redirect("/containers")
+    if request.method=="POST":
+        expected=max(0,int(request.form.get("expected_cartons",0)))
+        received=max(0,int(request.form.get("received_cartons",0)))
+        damaged=max(0,int(request.form.get("damaged_units",0)))
+        missing=max(0,int(request.form.get("missing_units",0)))
+        c.execute("INSERT INTO inbound_checks(container_id,article_no,expected_cartons,received_cartons,damaged_units,missing_units,note,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                  (cid,request.form["article_no"].strip(),expected,received,damaged,missing,request.form.get("note","").strip(),datetime.now().isoformat(timespec="minutes")))
+        c.commit(); c.close(); return redirect(f"/container/{cid}/check")
+    checks=c.execute("SELECT * FROM inbound_checks WHERE container_id=? ORDER BY id DESC",(cid,)).fetchall()
+    c.close()
+    html=f'''<div class="kicker">WARENEINGANGSKONTROLLE</div><h1 class="page-title">{cont["container_no"]}</h1>
+    <div class="card"><form method="post">
+    Artikelnummer<input name="article_no" required>
+    <div class="row"><div>Soll-Kartons<input type="number" min="0" name="expected_cartons" required></div>
+    <div>Ist-Kartons<input type="number" min="0" name="received_cartons" required></div></div>
+    <div class="row"><div>Beschädigte Artikel<input type="number" min="0" name="damaged_units" value="0"></div>
+    <div>Fehlende Artikel<input type="number" min="0" name="missing_units" value="0"></div></div>
+    Notiz<input name="note" placeholder="Schaden, Fehlmenge, falsche Ware …">
+    <button>Prüfung speichern</button></form></div>
+    <div class="card"><table><tr><th>Zeit</th><th>Artikel</th><th>Soll</th><th>Ist</th><th>Schaden</th><th>Fehlt</th><th>Notiz</th></tr>'''
+    for x in checks:
+        html += f'<tr><td>{x["created_at"]}</td><td>{x["article_no"]}</td><td>{x["expected_cartons"]}</td><td>{x["received_cartons"]}</td><td>{x["damaged_units"]}</td><td>{x["missing_units"]}</td><td>{x["note"] or "–"}</td></tr>'
+    html += '</table></div>'
+    return page(html,"containers")
+
+
+@app.route("/tasks", methods=["GET","POST"])
+def tasks_page():
+    c=con()
+    if request.method=="POST":
+        c.execute("INSERT INTO tasks(title,task_type,priority,carrier_no,from_slot,to_slot,note,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (request.form["title"].strip(),request.form["task_type"],request.form["priority"],request.form.get("carrier_no","").strip(),
+                   request.form.get("from_slot","").strip(),request.form.get("to_slot","").strip(),request.form.get("note","").strip(),
+                   "offen",datetime.now().isoformat(timespec="minutes")))
+        c.commit(); c.close(); return redirect("/tasks")
+    rows=c.execute("SELECT * FROM tasks ORDER BY CASE priority WHEN 'Dringend' THEN 0 WHEN 'Hoch' THEN 1 ELSE 2 END,id DESC").fetchall()
+    c.close()
+    html='''<div class="kicker">ARBEITSAUFTRÄGE</div><h1 class="page-title">Aufgaben</h1>
+    <div class="card"><form method="post">Titel<input name="title" required>
+    <div class="row"><div>Typ<select name="task_type"><option>Umlagerung</option><option>Auslagerung</option><option>Inventur</option><option>Problemprüfung</option><option>Allgemein</option></select></div>
+    <div>Priorität<select name="priority"><option>Normal</option><option>Hoch</option><option>Dringend</option></select></div></div>
+    <div class="row"><div>Ladungsträger<input name="carrier_no"></div><div>Von<input name="from_slot" placeholder="22/1/82"></div></div>
+    Nach<input name="to_slot" placeholder="15/3/42">Notiz<input name="note"><button>Auftrag erstellen</button></form></div>
+    <div class="card"><table><tr><th>Priorität</th><th>Auftrag</th><th>Träger</th><th>Von</th><th>Nach</th><th>Status</th><th></th></tr>'''
+    for x in rows:
+        pcls="red" if x["priority"]=="Dringend" else ("yellow" if x["priority"]=="Hoch" else "green")
+        html += f'<tr><td><span class="pill {pcls}">{x["priority"]}</span></td><td><b>{x["title"]}</b><br><span class="muted">{x["task_type"]}</span></td><td>{x["carrier_no"] or "–"}</td><td>{x["from_slot"] or "–"}</td><td>{x["to_slot"] or "–"}</td><td>{x["status"]}</td><td>'
+        if x["status"]=="offen":
+            html += f'<a class="yellow-link" href="/task/{x["id"]}/done">Erledigt ✓</a>'
+        html += '</td></tr>'
+    html += '</table></div>'
+    return page(html,"dashboard")
+
+
+@app.route("/task/<int:tid>/done")
+def task_done(tid):
+    c=con()
+    c.execute("UPDATE tasks SET status='erledigt',completed_at=? WHERE id=?",(datetime.now().isoformat(timespec="minutes"),tid))
+    c.commit(); c.close()
+    return redirect("/tasks")
+
+
+@app.route("/inventory", methods=["GET","POST"])
+def inventory():
+    msg=""
+    if request.method=="POST":
+        code=request.form.get("slot_code","").strip()
+        scanned=request.form.get("carrier_no","").strip()
+        parsed=parse_slot(code)
+        if not parsed:
+            msg="Ungültiger Lagerplatz."
+        else:
+            r,l,p=parsed
+            c=con()
+            slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+            expected=(slot["load_carrier_no"] or "") if slot else ""
+            result="OK" if expected==scanned else "DIFFERENZ"
+            c.execute("INSERT INTO inventory_checks(slot_code,expected_carrier,scanned_carrier,result,created_at) VALUES(?,?,?,?,?)",
+                      (code,expected,scanned,result,datetime.now().isoformat(timespec="minutes")))
+            c.commit(); c.close()
+            msg=f'{result}: System = {expected or "LEER"}, Scan = {scanned or "LEER"}'
+    c=con()
+    rows=c.execute("SELECT * FROM inventory_checks ORDER BY id DESC LIMIT 100").fetchall()
+    c.close()
+    html='''<div class="kicker">INVENTUR</div><h1 class="page-title">Inventur per Scan</h1>
+    <div class="scanbox"><form method="post">Lagerplatz scannen<input class="scan-input" name="slot_code" required placeholder="22/1/82">
+    Ladungsträger scannen <span class="muted">(leer lassen, wenn Platz leer ist)</span><input class="scan-input" name="carrier_no">
+    <button>Soll / Ist vergleichen</button></form></div>'''
+    if msg:
+        cls="ok" if msg.startswith("OK") else "danger"
+        html += f'<div class="notice"><b class="{cls}">{msg}</b></div>'
+    html += '<div class="card"><table><tr><th>Zeit</th><th>Platz</th><th>Soll</th><th>Ist</th><th>Ergebnis</th></tr>'
+    for x in rows:
+        cls="ok" if x["result"]=="OK" else "danger"
+        html += f'<tr><td>{x["created_at"]}</td><td>{x["slot_code"]}</td><td>{x["expected_carrier"] or "LEER"}</td><td>{x["scanned_carrier"] or "LEER"}</td><td class="{cls}"><b>{x["result"]}</b></td></tr>'
+    html += '</table></div>'
+    return page(html,"warehouse")
+
+
+@app.route("/slot-admin", methods=["GET","POST"])
+def slot_admin():
+    msg=""
+    c=con()
+    if request.method=="POST":
+        code=request.form.get("slot_code","").strip()
+        parsed=parse_slot(code)
+        if not parsed:
+            msg="Ungültiger Lagerplatz."
+        else:
+            r,l,p=parsed
+            action=request.form.get("action")
+            slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+            if action=="block":
+                if slot["load_carrier_id"]:
+                    msg="Belegten Platz zuerst umlagern oder auslagern."
+                else:
+                    c.execute("UPDATE warehouse_slots SET slot_status='gesperrt',block_reason=? WHERE rack=? AND level=? AND position=?",
+                              (request.form.get("reason","").strip() or "Gesperrt",r,l,p))
+                    c.commit(); msg=f"{code} wurde gesperrt."
+            else:
+                c.execute("UPDATE warehouse_slots SET slot_status=CASE WHEN load_carrier_id IS NULL THEN 'frei' ELSE 'belegt' END,block_reason=NULL WHERE rack=? AND level=? AND position=?",(r,l,p))
+                c.commit(); msg=f"{code} wurde freigegeben."
+    blocked=c.execute("SELECT * FROM warehouse_slots WHERE slot_status='gesperrt' ORDER BY rack,level,position").fetchall()
+    c.close()
+    html='''<div class="kicker">SPERRPLÄTZE</div><h1 class="page-title">Lagerplätze sperren</h1>
+    <div class="card"><form method="post">Lagerplatz<input class="scan-input" name="slot_code" required placeholder="22/1/82">
+    Grund<input name="reason" placeholder="Regalschaden, Reparatur, Inventur …">
+    <div class="row"><button name="action" value="block">Platz sperren</button><button name="action" value="release">Platz freigeben</button></div></form></div>'''
+    if msg: html += f'<div class="notice">{msg}</div>'
+    html += '<div class="card"><h2>Aktuell gesperrt</h2><table><tr><th>Platz</th><th>Grund</th></tr>'
+    for s in blocked:
+        html += f'<tr><td><b>{s["rack"]}/{s["level"]}/{s["position"]}</b></td><td>{s["block_reason"] or "–"}</td></tr>'
+    html += '</table></div>'
+    return page(html,"warehouse")
+
+
+@app.route("/carrier/<int:lid>/quality", methods=["POST"])
+def carrier_quality(lid):
+    c=con()
+    status=request.form.get("quality_status","frei")
+    note=request.form.get("quality_note","").strip()
+    c.execute("UPDATE load_carriers SET quality_status=?,quality_note=? WHERE id=?",(status,note,lid))
+    lt=c.execute("SELECT * FROM load_carriers WHERE id=?",(lid,)).fetchone()
+    if lt:
+        c.execute("INSERT INTO movements(load_carrier_id,carrier_no,movement_type,created_at) VALUES(?,?,?,?)",
+                  (lid,lt["carrier_no"],f"Qualität: {status}",datetime.now().isoformat(timespec="minutes")))
+    c.commit(); c.close()
+    return redirect(f"/carrier/{lid}")
+
+
+@app.route("/quality")
+def quality():
+    c=con()
+    rows=c.execute("SELECT * FROM load_carriers WHERE quality_status!='frei' ORDER BY id DESC").fetchall()
+    c.close()
+    html='''<div class="kicker">QUALITÄT</div><h1 class="page-title">Quarantäne & Sperrbestand</h1>
+    <div class="card"><table><tr><th>Träger</th><th>Artikel</th><th>Menge</th><th>Status</th><th>Notiz</th></tr>'''
+    for x in rows:
+        html += f'<tr><td><a style="color:white" href="/carrier/{x["id"]}">{x["carrier_no"]}</a></td><td>{x["article_no"] or "–"}</td><td>{x["quantity"]}</td><td><span class="pill yellow">{x["quality_status"]}</span></td><td>{x["quality_note"] or "–"}</td></tr>'
+    html += '</table></div>'
+    return page(html,"carriers")
+
+
+@app.route("/sync", methods=["GET","POST"])
+def sync_page():
+    c=con()
+    if request.method=="POST":
+        c.execute("INSERT INTO sage_sync_queue(entity_type,entity_id,action,payload,status,created_at) VALUES(?,?,?,?,?,?)",
+                  (request.form["entity_type"],request.form["entity_id"].strip(),request.form["action"],
+                   request.form.get("payload",""),"wartet",datetime.now().isoformat(timespec="minutes")))
+        c.commit(); c.close(); return redirect("/sync")
+    rows=c.execute("SELECT * FROM sage_sync_queue ORDER BY id DESC LIMIT 200").fetchall()
+    c.close()
+    html='''<div class="kicker">SAGE</div><h1 class="page-title">Sage-Synchronisation</h1>
+    <div class="notice"><b>Test-/Vorbereitungsmodus.</b><br><span class="muted">Hier sammeln wir Buchungen für Sage. Die echte Verbindung zum Sage-Testserver wird aktiviert, sobald Sage-Version/API/ODBC und Testzugang feststehen.</span></div>
+    <div class="card"><form method="post"><div class="row"><div>Objekt<select name="entity_type"><option>Artikel</option><option>Ladungsträger</option><option>Lagerbewegung</option><option>Wareneingang</option></select></div>
+    <div>Aktion<select name="action"><option>CREATE</option><option>UPDATE</option><option>POST</option></select></div></div>
+    ID / Nummer<input name="entity_id" required>Test-Payload<input name="payload"><button>In Sync-Warteschlange</button></form></div>
+    <div class="card"><table><tr><th>Zeit</th><th>Objekt</th><th>ID</th><th>Aktion</th><th>Status</th><th>Fehler</th></tr>'''
+    for x in rows:
+        cls="green" if x["status"]=="synced" else ("red" if x["status"]=="fehler" else "yellow")
+        html += f'<tr><td>{x["created_at"]}</td><td>{x["entity_type"]}</td><td>{x["entity_id"]}</td><td>{x["action"]}</td><td><span class="pill {cls}">{x["status"]}</span></td><td>{x["error_text"] or "–"}</td></tr>'
+    html += '</table></div>'
+    return page(html,"dashboard")
+
+
+@app.route("/reports")
+def reports():
+    c=con()
+    today=datetime.now().strftime("%Y-%m-%d")
+    stored_today=c.execute("SELECT COUNT(*) FROM movements WHERE movement_type LIKE 'Einlagerung%' AND created_at LIKE ?",(today+"%",)).fetchone()[0]
+    moves_today=c.execute("SELECT COUNT(*) FROM movements WHERE created_at LIKE ?",(today+"%",)).fetchone()[0]
+    inv_diff=c.execute("SELECT COUNT(*) FROM inventory_checks WHERE result='DIFFERENZ'").fetchone()[0]
+    open_tasks=c.execute("SELECT COUNT(*) FROM tasks WHERE status='offen'").fetchone()[0]
+    blocked=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE slot_status='gesperrt'").fetchone()[0]
+    quarantine=c.execute("SELECT COUNT(*) FROM load_carriers WHERE quality_status='quarantaene'").fetchone()[0]
+    c.close()
+    html=f'''<div class="kicker">BERICHTE</div><h1 class="page-title">Kennzahlen</h1>
+    <div class="metric-grid"><div class="metric"><span class="muted">Einlagerungen heute</span><strong>{stored_today}</strong></div>
+    <div class="metric"><span class="muted">Bewegungen heute</span><strong>{moves_today}</strong></div>
+    <div class="metric"><span class="muted">Inventurdifferenzen</span><strong>{inv_diff}</strong></div>
+    <div class="metric"><span class="muted">Offene Aufträge</span><strong>{open_tasks}</strong></div>
+    <div class="metric"><span class="muted">Gesperrte Plätze</span><strong>{blocked}</strong></div>
+    <div class="metric"><span class="muted">Quarantäne-Träger</span><strong>{quarantine}</strong></div></div>
+    <div class="card"><p class="muted">Container-Durchlaufzeiten, Wege/Heatmap, Schichtleistung und Excel/PDF-Exporte können darauf aufbauen.</p></div>'''
+    return page(html,"dashboard")
+
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    return {"name":"Lagerprozess","short_name":"Lagerprozess","start_url":"/","display":"standalone",
+            "background_color":"#07111f","theme_color":"#07111f"}
+
+
+@app.route("/sw.js")
+def service_worker():
+    js="self.addEventListener('install',e=>self.skipWaiting());\\nself.addEventListener('activate',e=>self.clients.claim());\\nself.addEventListener('fetch',e=>{});"
+    return js, 200, {"Content-Type":"application/javascript"}
+
+
+@app.route("/api/health")
+def health():
+    c=con(); c.execute("SELECT 1").fetchone(); c.close()
+    return {"ok":True,"database":True,"version":"V18"}
 
 
 @app.route("/gates")
