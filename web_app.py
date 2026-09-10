@@ -1,4 +1,4 @@
-# LagerPro V31 - Benutzerzugang + sichtbare Mehrfachauswahl
+# LagerPro V32 - Mehrfachbuchung Fix + 89-Platz-Unterstützung
 from flask import Flask, request, redirect, session
 import sqlite3, os, math, json, shutil, secrets
 from datetime import datetime, timedelta
@@ -1018,11 +1018,20 @@ def carrier_detail(lid):
 
 
 def parse_slot(code):
+    """Lagerplatz robust lesen. Akzeptiert z. B. 3/2/40 und 3-2-40.
+
+    Gang 1-7 haben 89 Positionen, alle weiteren Gänge 83.
+    """
     try:
-        r,l,p=[int(x) for x in code.strip().split("/")]
-        if 1<=r<=30 and 1<=l<=4 and 1<=p<=83:
+        normalized=(code or "").strip().replace("-", "/")
+        parts=[x.strip() for x in normalized.split("/") if x.strip()]
+        if len(parts) != 3:
+            return None
+        r,l,p=[int(x) for x in parts]
+        max_position=89 if 1 <= r <= 7 else 83
+        if 1<=r<=30 and 1<=l<=4 and 1<=p<=max_position:
             return r,l,p
-    except Exception:
+    except (TypeError, ValueError):
         pass
     return None
 
@@ -2172,19 +2181,145 @@ def stock_page():
 
 @app.route('/batch-booking',methods=['GET','POST'])
 def batch_booking():
-    c=con(); msg=''; gang=int(request.values.get('gang',1) or 1); level=int(request.values.get('level',1) or 1); maxpos=89 if gang<=7 else 83
+    c=con()
+    msg=''
+    try:
+        gang=max(1,min(30,int(request.values.get('gang',1) or 1)))
+    except (TypeError,ValueError):
+        gang=1
+    try:
+        level=max(1,min(4,int(request.values.get('level',1) or 1)))
+    except (TypeError,ValueError):
+        level=1
+    maxpos=89 if gang<=7 else 83
+
     if request.method=='POST':
-        ano=request.form.get('article_no','').strip(); aname=request.form.get('article_name','').strip() or ano; qty=max(1,int(request.form.get('quantity') or 1)); ptype=request.form.get('pallet_type','Euro'); booked=[]
-        if not c.execute("SELECT 1 FROM articles WHERE article_no=?",(ano,)).fetchone(): c.execute("INSERT INTO articles(article_no,name,article_name,pallet_type,cpp,storage_rule) VALUES(?,?,?,?,?,?)",(ano,aname,aname,ptype,qty,'Alle Ebenen'))
-        for code in request.form.getlist('slots'):
-            try:
-                r,l,p=parse_slot(code); sl=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
-                if not sl or sl['slot_status']!='frei' or sl['load_carrier_id']: continue
-                no='MAN-'+datetime.now().strftime('%y%m%d%H%M%S%f')[-16:]; cur=c.execute("INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,stored_at) VALUES(?,?,?,?,?,'eingelagert',?,?,?,?,?)",(no,ano,aname,qty,ptype,r,l,p,now_iso(),now_iso())); lid=cur.lastrowid; c.execute("UPDATE warehouse_slots SET load_carrier_id=?,load_carrier_no=?,article_no=?,article_name=?,pallet_type=?,quantity=?,slot_status='belegt',occupied_at=? WHERE rack=? AND level=? AND position=?",(lid,no,ano,aname,ptype,qty,now_iso(),r,l,p)); c.execute("INSERT INTO movements(load_carrier_id,carrier_no,movement_type,to_slot,created_at) VALUES(?,?,?,?,?)",(lid,no,'Mehrfach-Einlagerung',code,now_iso())); booked.append(code)
-            except Exception: pass
-        c.commit(); audit('Mehrfach-Einlagerung','article',ano,after={'slots':booked}); msg=f'{len(booked)} Paletten einzeln gebucht.'
-    slots=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position<=? ORDER BY position",(gang,level,maxpos)).fetchall(); arts=c.execute("SELECT article_no,COALESCE(article_name,name) n,pallet_type,cpp FROM articles ORDER BY n LIMIT 1000").fetchall(); c.close(); checks=''.join(f"<label class='slot {'free' if x['slot_status']=='frei' and not x['load_carrier_id'] else 'occupied'}'><input type='checkbox' name='slots' value='{gang}-{level}-{x['position']}' {'disabled' if x['slot_status']!='frei' or x['load_carrier_id'] else ''}><b>{gang}-{level}-{x['position']}</b><span>{x['slot_status']}</span></label>" for x in slots); opts=''.join(f"<option value='{a['article_no']}'>{a['n']} · {a['article_no']}</option>" for a in arts)
-    return page(f'<div class="kicker">MEHRFACHAUSWAHL</div><h1 class="page-title">Gleichen Artikel schneller einlagern</h1><div class="notice">Mehrere freie Plätze auswählen. Trotzdem wird jede Palette als eigener Ladungsträger mit eigener Historie gebucht.</div><div class="card"><form method="get"><div class="row"><input type="number" name="gang" min="1" max="30" value="{gang}"><input type="number" name="level" min="1" max="4" value="{level}"></div><button>Reihe anzeigen</button></form></div><form method="post"><input type="hidden" name="gang" value="{gang}"><input type="hidden" name="level" value="{level}"><div class="slot-grid">{checks}</div><div class="card"><p class="ok">{msg}</p><label>Artikelstamm</label><input list="arts" name="article_no" placeholder="Artikelnummer" required><datalist id="arts">{opts}</datalist><input name="article_name" placeholder="Artikelname" required><div class="row"><input type="number" name="quantity" min="1" value="1"><select name="pallet_type"><option>Euro</option><option>Einweg</option></select></div><button>Ausgewählte Plätze buchen</button></div></form>','warehouse')
+        selected_slots=request.form.getlist('slots')
+        ano=request.form.get('article_no','').strip()
+        aname=request.form.get('article_name','').strip()
+        try:
+            qty=max(1,int(request.form.get('quantity') or 1))
+        except (TypeError,ValueError):
+            qty=1
+        ptype=request.form.get('pallet_type','Euro').strip() or 'Euro'
+        booked=[]
+        skipped=[]
+
+        article=c.execute("SELECT * FROM articles WHERE article_no=?",(ano,)).fetchone() if ano else None
+        if article:
+            if not aname:
+                try:
+                    aname=(article['article_name'] or article['name'] or ano)
+                except Exception:
+                    aname=ano
+            storage_rule=article['storage_rule'] or 'Alle Ebenen'
+            # Bestehenden Palettentyp aus dem Stamm verwenden, falls im Formular nichts Sinnvolles ankommt.
+            if ptype not in ('Euro','Einweg'):
+                ptype=article['pallet_type'] or 'Euro'
+        else:
+            storage_rule='Alle Ebenen'
+            if ano:
+                if not aname:
+                    aname=ano
+                c.execute("INSERT INTO articles(article_no,name,article_name,pallet_type,cpp,storage_rule) VALUES(?,?,?,?,?,?)",
+                          (ano,aname,aname,ptype,qty,storage_rule))
+
+        if not ano:
+            msg='Bitte einen Artikel auswählen oder eine Artikelnummer eingeben.'
+        elif not selected_slots:
+            msg='Keine Lagerplätze ausgewählt.'
+        else:
+            for raw_code in selected_slots:
+                parsed=parse_slot(raw_code)
+                if not parsed:
+                    skipped.append(f'{raw_code}: ungültiger Lagerplatz')
+                    continue
+                r,l,p=parsed
+                # POST darf nur die aktuell gewählte Reihe buchen.
+                if r != gang or l != level:
+                    skipped.append(f'{raw_code}: gehört nicht zur gewählten Reihe')
+                    continue
+                sl=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+                if not sl:
+                    skipped.append(f'{raw_code}: Lagerplatz fehlt')
+                    continue
+                if sl['slot_status']!='frei' or sl['load_carrier_id']:
+                    skipped.append(f'{raw_code}: nicht mehr frei')
+                    continue
+                if storage_rule=='Nur Ebene 1' and l!=1:
+                    skipped.append(f'{raw_code}: Artikel nur Ebene 1')
+                    continue
+                if storage_rule=='Nur Ebene 2-4' and l==1:
+                    skipped.append(f'{raw_code}: Artikel nur Ebene 2-4')
+                    continue
+
+                # Euro und Einweg dürfen nicht direkt nebeneinander stehen.
+                neighbors=c.execute("""SELECT pallet_type FROM warehouse_slots
+                    WHERE rack=? AND level=? AND position IN (?,?) AND load_carrier_id IS NOT NULL""",
+                    (r,l,p-1,p+1)).fetchall()
+                this_euro=(ptype=='Euro')
+                conflict=any((n['pallet_type']=='Euro') != this_euro for n in neighbors if n['pallet_type'])
+                if conflict:
+                    skipped.append(f'{raw_code}: Euro/Einweg-Nachbarschaft nicht erlaubt')
+                    continue
+
+                try:
+                    now=now_iso()
+                    no='MAN-'+datetime.now().strftime('%y%m%d%H%M%S%f')[-16:]
+                    cur=c.execute("""INSERT INTO load_carriers(
+                        carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,stored_at
+                    ) VALUES(?,?,?,?,?,'eingelagert',?,?,?,?,?)""",
+                    (no,ano,aname,qty,ptype,r,l,p,now,now))
+                    lid=cur.lastrowid
+                    c.execute("""UPDATE warehouse_slots SET
+                        load_carrier_id=?,load_carrier_no=?,article_no=?,article_name=?,pallet_type=?,quantity=?,
+                        slot_status='belegt',occupied_at=?
+                        WHERE rack=? AND level=? AND position=?""",
+                        (lid,no,ano,aname,ptype,qty,now,r,l,p))
+                    standard_code=f'{r}/{l}/{p}'
+                    c.execute("INSERT INTO movements(load_carrier_id,carrier_no,movement_type,to_slot,created_at) VALUES(?,?,?,?,?)",
+                              (lid,no,'Mehrfach-Einlagerung',standard_code,now))
+                    booked.append(standard_code)
+                except Exception as exc:
+                    skipped.append(f'{raw_code}: Buchungsfehler {type(exc).__name__}')
+
+            c.commit()
+            audit('Mehrfach-Einlagerung','article',ano,after={'slots':booked,'skipped':len(skipped)})
+            msg=f'{len(booked)} Paletten eingelagert.'
+            if skipped:
+                msg += f' {len(skipped)} Platz/Plätze wurden übersprungen.'
+
+    slots=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position<=? ORDER BY position",
+                    (gang,level,maxpos)).fetchall()
+    arts=c.execute("SELECT article_no,COALESCE(article_name,name) n,pallet_type,cpp FROM articles ORDER BY n LIMIT 1000").fetchall()
+    c.close()
+
+    checks=''.join(
+        f"<label class='slot {'free' if x['slot_status']=='frei' and not x['load_carrier_id'] else 'occupied'}'>"
+        f"<input type='checkbox' name='slots' value='{gang}/{level}/{x['position']}' "
+        f"{'disabled' if x['slot_status']!='frei' or x['load_carrier_id'] else ''}>"
+        f"<b>{gang}-{level}-{x['position']}</b><span>{x['slot_status']}</span></label>"
+        for x in slots
+    )
+    opts=''.join(f"<option value='{a['article_no']}'>{a['n']} · {a['article_no']}</option>" for a in arts)
+    return page(
+        f'<div class="kicker">MEHRFACHAUSWAHL</div>'
+        f'<h1 class="page-title">Gleichen Artikel schneller einlagern</h1>'
+        f'<div class="notice">Mehrere freie Plätze auswählen. Jede Palette wird weiterhin als eigener Ladungsträger mit eigener Historie gebucht.</div>'
+        f'<div class="card"><form method="get"><div class="row">'
+        f'<input type="number" name="gang" min="1" max="30" value="{gang}">'
+        f'<input type="number" name="level" min="1" max="4" value="{level}"></div>'
+        f'<button>Reihe anzeigen</button></form></div>'
+        f'<form method="post"><input type="hidden" name="gang" value="{gang}">'
+        f'<input type="hidden" name="level" value="{level}"><div class="slot-grid">{checks}</div>'
+        f'<div class="card"><p class="ok">{msg}</p><label>Artikelstamm</label>'
+        f'<input list="arts" name="article_no" placeholder="Artikelnummer" required><datalist id="arts">{opts}</datalist>'
+        f'<input name="article_name" placeholder="Artikelname (bei neuem Artikel)">'
+        f'<div class="row"><input type="number" name="quantity" min="1" value="1">'
+        f'<select name="pallet_type"><option>Euro</option><option>Einweg</option></select></div>'
+        f'<button>Ausgewählte Plätze buchen</button></div></form>',
+        'warehouse'
+    )
 
 @app.route('/reservations',methods=['GET','POST'])
 def reservations_page():
