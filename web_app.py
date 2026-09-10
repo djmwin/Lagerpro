@@ -1394,7 +1394,7 @@ def camera_scan():
 
     <div class="notice">
       <b>Erkannt werden:</b> Ladungsträgernummer, Artikelnummer, Artikelbezeichnung und Lagerplatz.
-      <br><span class="muted">Vor dem Buchen werden alle Werte zur Kontrolle angezeigt.</span>
+      <br><span class="muted">Artikelnummer, Artikelbezeichnung und Lagerplatz werden automatisch in die Felder übernommen. Fehlende Artikel werden nach der Bestätigung automatisch im Artikelstamm angelegt.</span>
     </div>
 
     <div class="camera-grid">
@@ -1439,13 +1439,13 @@ def camera_scan():
     </div>
 
     <div class="card">
-      <h2>3 · Prüfen und übernehmen</h2>
+      <h2>3 · Automatisch übernehmen</h2>
       <form method="post" action="/camera/confirm" onsubmit="return fillHidden()">
         <input type="hidden" name="carrier_no" id="carrierHidden">
         <input type="hidden" name="article_no" id="articleNoHidden">
         <input type="hidden" name="article_name" id="articleNameHidden">
         <input type="hidden" name="slot_code" id="slotHidden">
-        <button type="submit">Erkannte Daten prüfen</button>
+        <button type="submit">Erkannte Daten automatisch übernehmen</button>
       </form>
     </div>
 
@@ -1499,11 +1499,11 @@ def camera_scan():
           if(carrier)document.getElementById("carrierValue").value=carrier;
           if(ano)document.getElementById("articleNoValue").value=ano;
           if(aname)document.getElementById("articleNameValue").value=aname;
-          status.textContent=(carrier||ano||aname)?"Erkennung abgeschlossen – bitte prüfen.":"Nicht sicher erkannt – bitte manuell korrigieren.";
+          status.textContent=(carrier||ano||aname)?"Erkennung abgeschlossen – Felder wurden automatisch gefüllt.":"Nicht sicher erkannt – bitte manuell korrigieren.";
         }else{
           const slot=extractSlot(raw);
           if(slot)document.getElementById("slotValue").value=slot;
-          status.textContent=slot?"Lagerplatz erkannt – bitte prüfen.":"Lagerplatz nicht sicher erkannt.";
+          status.textContent=slot?"Lagerplatz erkannt und automatisch eingefügt.":"Lagerplatz nicht sicher erkannt.";
         }
       }catch(e){status.textContent="Erkennung fehlgeschlagen. Bitte erneut fotografieren oder manuell eintragen.";}
     }
@@ -1534,52 +1534,107 @@ def camera_confirm():
     article_name=request.form.get("article_name","").strip()
     slot_code=request.form.get("slot_code","").strip()
 
+    warnings=[]
+    actions=[]
     c=con()
+
+    # Article recognition is now productive: create article master automatically if missing.
+    article=None
+    if article_no:
+        article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone()
+        if not article:
+            safe_name=article_name or f"Artikel {article_no}"
+            c.execute("""INSERT INTO articles(article_no,article_name,pallet_type,storage_rule,units_per_carton)
+                         VALUES(?,?,?,?,?)""",
+                      (article_no,safe_name,"Euro","Egal",1))
+            c.commit()
+            article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone()
+            actions.append(f"Artikel {article_no} wurde automatisch im Artikelstamm angelegt.")
+            warnings.append("Neuer Artikel wurde mit Standardwerten angelegt: Euro, Lagerregel Egal, 1 Artikel/Karton. Bitte Stammdaten später prüfen.")
+        elif article_name and (not article["article_name"] or article["article_name"].startswith("Artikel ")):
+            c.execute("UPDATE articles SET article_name=? WHERE article_no=?",(article_name,article_no))
+            c.commit()
+            article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone()
+            actions.append("Artikelbezeichnung wurde aus dem Foto übernommen.")
+
     lt=c.execute("SELECT * FROM load_carriers WHERE carrier_no=?",(carrier_no,)).fetchone()
-    article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone() if article_no else None
+    if not lt:
+        # Company-generated carrier number is still respected: we only record the photographed real number.
+        c.execute("""INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,created_at)
+                     VALUES(?,?,?,?,?,?,?)""",
+                  (carrier_no,article_no or None,
+                   (article["article_name"] if article else article_name) or None,
+                   0,(article["pallet_type"] if article else "Euro"),
+                   "offen",datetime.now().isoformat(timespec="minutes")))
+        c.commit()
+        lt=c.execute("SELECT * FROM load_carriers WHERE carrier_no=?",(carrier_no,)).fetchone()
+        actions.append(f"Ladungsträger {carrier_no} wurde mit der fotografierten Nummer erfasst.")
+    elif article_no:
+        # Do not silently overwrite a different existing article assignment.
+        if lt["article_no"] and lt["article_no"] != article_no:
+            warnings.append(f'ACHTUNG: Ladungsträger ist bereits Artikel {lt["article_no"]} zugeordnet; Foto erkennt {article_no}. Keine automatische Änderung.')
+        elif not lt["article_no"]:
+            c.execute("""UPDATE load_carriers SET article_no=?,article_name=?,pallet_type=? WHERE id=?""",
+                      (article_no,
+                       (article["article_name"] if article else article_name),
+                       (article["pallet_type"] if article else lt["pallet_type"]),
+                       lt["id"]))
+            c.commit()
+            lt=c.execute("SELECT * FROM load_carriers WHERE id=?",(lt["id"],)).fetchone()
+            actions.append("Erkannter Artikel wurde dem Ladungsträger automatisch zugeordnet.")
+
+    parsed=parse_slot(slot_code)
+    slot=None
+    can_store=False
+    if not parsed:
+        warnings.append("Lagerplatz konnte nicht gültig erkannt werden. Erwartet wird z. B. 22/1/82.")
+    else:
+        r,l,p=parsed
+        slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+        if not slot:
+            warnings.append("Lagerplatz existiert nicht.")
+        elif slot["slot_status"]=="gesperrt":
+            warnings.append(f'Lagerplatz ist gesperrt: {slot["block_reason"] or "kein Grund angegeben"}.')
+        elif slot["load_carrier_id"] and slot["load_carrier_id"] != lt["id"]:
+            warnings.append(f'Lagerplatz ist bereits durch {slot["load_carrier_no"]} belegt.')
+        else:
+            can_store=True
+            actions.append(f"Lagerplatz {slot_code} wurde automatisch aus dem Foto übernommen.")
+
     c.close()
 
-    warnings=[]
-    if not lt:
-        warnings.append("Ladungsträger ist noch nicht im System angelegt.")
-    else:
-        if article_no and lt["article_no"] and article_no != lt["article_no"]:
-            warnings.append(f'Artikelnummer auf Foto ({article_no}) stimmt nicht mit dem Ladungsträger ({lt["article_no"]}) überein.')
-        if article_name and lt["article_name"] and article_name.lower() not in lt["article_name"].lower() and lt["article_name"].lower() not in article_name.lower():
-            warnings.append("Artikelbezeichnung auf Foto weicht vom gespeicherten Artikel ab.")
-
-    if article_no and not article:
-        warnings.append("Erkannte Artikelnummer ist nicht im Artikelstamm vorhanden.")
-    if not parse_slot(slot_code):
-        warnings.append("Erkannter Lagerplatz ist ungültig.")
-
     html=f"""
-    <div class="kicker">KAMERA-PRÜFUNG</div><h1 class="page-title">Erkannte Daten bestätigen</h1>
+    <div class="kicker">KAMERA-AUTOMATIK</div><h1 class="page-title">Foto erkannt & übernommen</h1>
     <div class="card"><table>
-      <tr><th>Feld</th><th>Erkannt</th><th>System</th></tr>
-      <tr><td>Ladungsträger</td><td><b>{carrier_no or "–"}</b></td><td>{"✓ vorhanden" if lt else "⚠ nicht gefunden"}</td></tr>
-      <tr><td>Artikelnummer</td><td><b>{article_no or "–"}</b></td><td>{"✓ Artikelstamm" if article else ("–" if not article_no else "⚠ unbekannt")}</td></tr>
-      <tr><td>Artikel</td><td>{article_name or "–"}</td><td>{(lt["article_name"] if lt else "–")}</td></tr>
-      <tr><td>Lagerplatz</td><td><b>{slot_code or "–"}</b></td><td>{"✓ gültig" if parse_slot(slot_code) else "⚠ ungültig"}</td></tr>
+      <tr><th>Feld</th><th>Erkannt / übernommen</th></tr>
+      <tr><td>Ladungsträger</td><td><b>{carrier_no or "–"}</b></td></tr>
+      <tr><td>Artikelnummer</td><td><b>{article_no or "–"}</b></td></tr>
+      <tr><td>Artikel</td><td>{(article["article_name"] if article else article_name) or "–"}</td></tr>
+      <tr><td>Lagerplatz</td><td><b>{slot_code or "–"}</b></td></tr>
     </table></div>
     """
+    if actions:
+        html += '<div class="card"><h2>Automatisch ausgeführt</h2>'
+        for a in actions: html += f'<div class="notice"><b class="ok">✓ {a}</b></div>'
+        html += '</div>'
     if warnings:
-        html += '<div class="card"><h2 class="warn">Bitte prüfen</h2>'
-        for w in warnings:
-            html += f'<div class="notice">{w}</div>'
+        html += '<div class="card"><h2 class="warn">Hinweise / Prüfung nötig</h2>'
+        for w in warnings: html += f'<div class="notice">{w}</div>'
         html += '</div>'
 
-    if lt and parse_slot(slot_code):
+    # Storage still passes through all normal safety/business-rule checks.
+    if can_store:
         html += f"""
         <div class="card">
           <form method="post" action="/store">
             <input type="hidden" name="carrier_no" value="{carrier_no}">
             <input type="hidden" name="slot_code" value="{slot_code}">
-            <button>Mit normaler Lagerprüfung einlagern</button>
+            <button>Jetzt mit Lagerregeln einlagern</button>
           </form>
+          <p class="muted">Die App prüft dabei weiterhin Sperrplatz, Ebene, Belegung, Qualitätsstatus und Euro/Einweg-Regel.</p>
         </div>
         """
-    html += '<div class="card"><a class="yellow-link" href="/camera">← Neues Foto aufnehmen</a></div>'
+    html += '<div class="card"><a class="yellow-link" href="/camera">← Nächstes Etikett fotografieren</a></div>'
     return page(html,"warehouse")
 
 
