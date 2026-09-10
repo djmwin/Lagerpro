@@ -456,6 +456,14 @@ th{color:#aebed3}
 .detect-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 @media(max-width:760px){.camera-grid,.detect-grid{grid-template-columns:1fr}}
 
+
+.slot.free{border-color:#25814d;background:#0d2618}
+.slot.free .slot-state{color:#57ec8e}
+.slot.occupied{border-color:#9a7a00;background:#2b230b}
+.slot.occupied .slot-state{color:#ffdc3a}
+.slot.blocked{border-color:#903d3d;background:#2a1016}
+.slot.blocked .slot-state{color:#ff7777}
+
 </style>
 """
 
@@ -545,6 +553,7 @@ def dashboard():
       <a class="action-card" href="/store"><b>⌁ Scan-Einlagerung</b><span class="muted">Ladungsträger + Lagerplatz</span></a>
       <a class="action-card" href="/search"><b>⌕ Wo ist meine Ware?</b><span class="muted">Artikel · Seriennummer · Ladungsträger</span></a>
       <a class="action-card" href="/camera"><b>◉ Kamera-Scan</b><span class="muted">Träger, Artikel und Lagerplatz fotografieren</span></a>
+      <a class="action-card" href="/manual-booking"><b>✎ Manuell buchen</b><span class="muted">Artikelnummer direkt auf Lagerplatz buchen</span></a>
     </section>
 
     <section class="cards">
@@ -1057,7 +1066,7 @@ def warehouse():
     c.close()
     ropts="".join(f'<option value="{x}" {"selected" if x==r else ""}>Regal {x}</option>' for x in range(1,31))
     lopts="".join(f'<option value="{x}" {"selected" if x==l else ""}>Ebene {x}</option>' for x in range(1,5))
-    html=f"""<div class="kicker">LAGER</div><h1 class="page-title">9.960 Stellplätze</h1>
+    html=f"""<div class="kicker">LAGER</div><div class="toolbar"><span class="pill green">GRÜN = FREI</span><span class="pill yellow">GELB = BELEGT</span><span class="pill red">ROT = GESPERRT</span></div><h1 class="page-title">9.960 Stellplätze</h1>
     <div class="card"><form method="get" class="warehouse-toolbar">
       <div>Regal<select name="rack" onchange="this.form.submit()">{ropts}</select></div>
       <div>Ebene<select name="level" onchange="this.form.submit()">{lopts}</select></div>
@@ -1723,6 +1732,115 @@ def camera_confirm():
         </div>
         """
     html += '<div class="card"><a class="yellow-link" href="/camera">← Nächstes Etikett fotografieren</a></div>'
+    return page(html,"warehouse")
+
+
+
+@app.route("/manual-booking", methods=["GET","POST"])
+def manual_booking():
+    msg=""
+    success=False
+    c=con()
+
+    if request.method=="POST":
+        article_no=request.form.get("article_no","").strip()
+        slot_code=request.form.get("slot_code","").strip()
+        try:
+            quantity=max(1,int(float((request.form.get("quantity","1") or "1").replace(",","."))))
+        except Exception:
+            quantity=1
+
+        article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone()
+        parsed=parse_slot(slot_code)
+
+        if not article:
+            msg=f"Artikel {article_no} ist nicht im Artikelstamm vorhanden."
+        elif not parsed:
+            msg="Lagerplatz ungültig. Format z. B. 22/3/37."
+        else:
+            r,l,p=parsed
+            slot=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position=?",(r,l,p)).fetchone()
+
+            if not slot:
+                msg="Lagerplatz existiert nicht."
+            elif slot["slot_status"]=="gesperrt":
+                msg=f'Lagerplatz ist gesperrt: {slot["block_reason"] or "kein Grund angegeben"}.'
+            elif slot["load_carrier_id"]:
+                msg=f'Der Platz ist bereits durch {slot["load_carrier_no"] or "einen Ladungsträger"} belegt.'
+            else:
+                rule=(article["storage_rule"] or "Egal")
+                if rule=="Nur Ebene 1" and l!=1:
+                    msg="Dieser Artikel darf nur auf Ebene 1 eingelagert werden."
+                elif rule=="Nur Ebene 2-4" and l==1:
+                    msg="Dieser Artikel darf nur auf Ebene 2–4 eingelagert werden."
+                else:
+                    stamp=datetime.now().strftime("%Y%m%d%H%M%S%f")
+                    carrier_no=f"MAN-{r}-{l}-{p}-{stamp[-6:]}"
+                    now=datetime.now().isoformat(timespec="minutes")
+
+                    c.execute(
+                        "INSERT INTO load_carriers(carrier_no,article_no,article_name,quantity,pallet_type,status,rack,level,position,created_at,closed_at,stored_at,quality_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (carrier_no,article["article_no"],article["article_name"],quantity,
+                         article["pallet_type"],"eingelagert",r,l,p,now,now,now,"frei")
+                    )
+                    lid=c.lastrowid
+
+                    c.execute(
+                        "UPDATE warehouse_slots SET article_no=?,article_name=?,pallet_type=?,quantity=?,occupied_at=?,load_carrier_no=?,load_carrier_id=?,slot_status='belegt' WHERE rack=? AND level=? AND position=?",
+                        (article["article_no"],article["article_name"],article["pallet_type"],quantity,
+                         now,carrier_no,lid,r,l,p)
+                    )
+
+                    c.execute(
+                        "INSERT INTO movements(load_carrier_id,carrier_no,movement_type,from_slot,to_slot,created_at) VALUES(?,?,?,?,?,?)",
+                        (lid,carrier_no,"Manuelle Direktbuchung",None,slot_code,now)
+                    )
+
+                    c.commit()
+                    msg=f'{article["article_no"]} - {article["article_name"]} wurde mit Menge {quantity} auf {slot_code} gebucht.'
+                    success=True
+
+    articles=c.execute("SELECT article_no,article_name FROM articles ORDER BY article_no LIMIT 500").fetchall()
+    c.close()
+
+    html="""<div class="kicker">MANUELLE DIREKTBUCHUNG</div>
+    <h1 class="page-title">Artikel direkt auf Lagerplatz buchen</h1>
+    <div class="notice">
+      <b>Schnellfunktion für den Lagergang.</b><br>
+      <span class="muted">Artikelnummer eingeben oder scannen, Lagerplatz eingeben/scannen und buchen.
+      Im Hintergrund erzeugt die App automatisch einen technischen MAN-Ladungsträger, damit Historie und Lagerstruktur sauber bleiben.</span>
+    </div>
+    <div class="card">
+      <form method="post">
+        Artikelnummer
+        <input class="scan-input" name="article_no" list="article-list" required autofocus placeholder="z. B. LD660807">
+        <datalist id="article-list">"""
+    for a in articles:
+        html += f'<option value="{a["article_no"]}">{a["article_name"]}</option>'
+    html += """</datalist>
+        <div class="row">
+          <div>
+            Lagerplatz
+            <input class="scan-input" name="slot_code" required placeholder="z. B. 22/3/37">
+          </div>
+          <div>
+            Menge
+            <input class="scan-input" type="number" min="1" name="quantity" value="1" required>
+          </div>
+        </div>
+        <button>Artikel auf Lagerplatz buchen</button>
+      </form>
+    </div>"""
+
+    if msg:
+        cls="ok" if success else "danger"
+        html += f'<div class="notice"><b class="{cls}">{msg}</b></div>'
+
+    html += """<div class="card">
+      <h2>Beispiel</h2>
+      <p><b>Artikel:</b> LD660807 &nbsp; - &nbsp; <b>Lagerplatz:</b> 22/3/37 &nbsp; - &nbsp; <b>Menge:</b> 1</p>
+      <p class="muted">Die Buchung erscheint danach sofort in Lageransicht, Suche und Bewegungsverlauf.</p>
+    </div>"""
     return page(html,"warehouse")
 
 
