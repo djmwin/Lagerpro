@@ -445,6 +445,17 @@ th{color:#aebed3}
 @media(max-width:900px){.leit-grid{grid-template-columns:repeat(2,1fr)}.metric-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:560px){.leit-grid,.metric-grid{grid-template-columns:1fr}}
 
+
+.camera-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.camera-card{background:#091827;border:1px solid #294766;border-radius:16px;padding:14px}
+.camera-preview{width:100%;max-height:300px;object-fit:contain;border-radius:12px;background:#050b12;margin-top:10px;display:none}
+.camera-result{margin-top:10px;padding:10px;border-radius:10px;background:#0b2033;border:1px solid #315a83}
+.camera-status{font-size:13px;color:#aebed0;margin-top:8px}
+.camera-actions{display:flex;gap:8px;flex-wrap:wrap}
+.camera-file{position:absolute;left:-9999px}
+.detect-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media(max-width:760px){.camera-grid,.detect-grid{grid-template-columns:1fr}}
+
 </style>
 """
 
@@ -533,6 +544,7 @@ def dashboard():
       <a class="action-card" href="/control"><b>▦ Wareneingangs-Leitstand</b><span class="muted">Tore 8–12 · Fortschritt · Probleme</span></a>
       <a class="action-card" href="/store"><b>⌁ Scan-Einlagerung</b><span class="muted">Ladungsträger + Lagerplatz</span></a>
       <a class="action-card" href="/search"><b>⌕ Wo ist meine Ware?</b><span class="muted">Artikel · Seriennummer · Ladungsträger</span></a>
+      <a class="action-card" href="/camera"><b>◉ Kamera-Scan</b><span class="muted">Träger, Artikel und Lagerplatz fotografieren</span></a>
     </section>
 
     <section class="cards">
@@ -1371,6 +1383,204 @@ def service_worker():
 def health():
     c=con(); c.execute("SELECT 1").fetchone(); c.close()
     return {"ok":True,"database":True,"version":"V18"}
+
+
+
+@app.route("/camera")
+def camera_scan():
+    html = r"""
+    <div class="kicker">KAMERA-SCAN · TEST</div>
+    <h1 class="page-title">Ladungsträger & Lagerplatz per Foto</h1>
+
+    <div class="notice">
+      <b>Erkannt werden:</b> Ladungsträgernummer, Artikelnummer, Artikelbezeichnung und Lagerplatz.
+      <br><span class="muted">Vor dem Buchen werden alle Werte zur Kontrolle angezeigt.</span>
+    </div>
+
+    <div class="camera-grid">
+      <div class="camera-card">
+        <h2>1 · Ladungsträger-Etikett</h2>
+        <p class="muted">Fotografiere das Etikett so, dass Trägernummer, Artikelnummer und Artikelname lesbar sind.</p>
+        <div class="camera-actions">
+          <label class="small-btn" for="carrierPhoto">📷 Etikett fotografieren</label>
+          <button type="button" class="small-btn" onclick="resetCarrier()">Zurücksetzen</button>
+        </div>
+        <input class="camera-file" id="carrierPhoto" type="file" accept="image/*" capture="environment">
+        <img id="carrierPreview" class="camera-preview">
+        <div id="carrierStatus" class="camera-status">Noch kein Foto.</div>
+
+        <div class="detect-grid">
+          <div class="camera-result">Ladungsträgernummer
+            <input class="scan-input" id="carrierValue" placeholder="z. B. LT123456">
+          </div>
+          <div class="camera-result">Artikelnummer
+            <input class="scan-input" id="articleNoValue" placeholder="Artikelnummer">
+          </div>
+        </div>
+        <div class="camera-result">Artikelbezeichnung
+          <input class="scan-input" id="articleNameValue" placeholder="Artikelname">
+        </div>
+      </div>
+
+      <div class="camera-card">
+        <h2>2 · Lagerplatz</h2>
+        <p class="muted">Fotografiere das Lagerplatzschild, z. B. <b>22/1/82</b>.</p>
+        <div class="camera-actions">
+          <label class="small-btn" for="slotPhoto">📷 Lagerplatz fotografieren</label>
+          <button type="button" class="small-btn" onclick="resetSlot()">Zurücksetzen</button>
+        </div>
+        <input class="camera-file" id="slotPhoto" type="file" accept="image/*" capture="environment">
+        <img id="slotPreview" class="camera-preview">
+        <div id="slotStatus" class="camera-status">Noch kein Foto.</div>
+        <div class="camera-result">Lagerplatz
+          <input class="scan-input" id="slotValue" placeholder="22/1/82">
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>3 · Prüfen und übernehmen</h2>
+      <form method="post" action="/camera/confirm" onsubmit="return fillHidden()">
+        <input type="hidden" name="carrier_no" id="carrierHidden">
+        <input type="hidden" name="article_no" id="articleNoHidden">
+        <input type="hidden" name="article_name" id="articleNameHidden">
+        <input type="hidden" name="slot_code" id="slotHidden">
+        <button type="submit">Erkannte Daten prüfen</button>
+      </form>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+    <script>
+    function cleanLine(s){return (s||"").replace(/\s+/g," ").trim();}
+    function extractSlot(text){
+      const m=text.match(/\b([1-9]|[12][0-9]|30)\s*[\/\-]\s*([1-4])\s*[\/\-]\s*([1-9]|[1-7][0-9]|8[0-3])\b/);
+      return m?`${m[1]}/${m[2]}/${m[3]}`:"";
+    }
+    function extractCarrier(text){
+      const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
+      for(const line of lines){
+        if(/ladungstr[aä]ger|tr[aä]ger|load.?carrier/i.test(line)){
+          const p=line.split(/[:#]/); if(p.length>1) return cleanLine(p.slice(1).join(":"));
+        }
+      }
+      const m=text.match(/\b(?:LT|LGT|TR)[A-Z0-9\-]{3,}\b/i); return m?m[0]:"";
+    }
+    function extractArticleNo(text){
+      const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
+      for(const line of lines){
+        if(/artikel(?:nummer|nr\.?| no\.?)|article(?: number| no\.?)/i.test(line)){
+          const p=line.split(/[:#]/); if(p.length>1) return cleanLine(p.slice(1).join(":"));
+        }
+      }
+      return "";
+    }
+    function extractArticleName(text){
+      const lines=text.split(/\n/).map(cleanLine).filter(Boolean);
+      for(const line of lines){
+        if(/artikel(?:bezeichnung|name)|bezeichnung|description|article name/i.test(line)){
+          const p=line.split(/[:#]/); if(p.length>1) return cleanLine(p.slice(1).join(":"));
+        }
+      }
+      return "";
+    }
+    async function runOCR(file,target){
+      if(!file)return;
+      const status=document.getElementById(target+"Status");
+      const preview=document.getElementById(target+"Preview");
+      preview.src=URL.createObjectURL(file); preview.style.display="block";
+      status.textContent="Foto wird gelesen …";
+      try{
+        const result=await Tesseract.recognize(file,"deu+eng",{logger:m=>{
+          if(m.status==="recognizing text") status.textContent=`Text wird erkannt … ${Math.round((m.progress||0)*100)} %`;
+        }});
+        const raw=result.data.text||"";
+        if(target==="carrier"){
+          const carrier=extractCarrier(raw), ano=extractArticleNo(raw), aname=extractArticleName(raw);
+          if(carrier)document.getElementById("carrierValue").value=carrier;
+          if(ano)document.getElementById("articleNoValue").value=ano;
+          if(aname)document.getElementById("articleNameValue").value=aname;
+          status.textContent=(carrier||ano||aname)?"Erkennung abgeschlossen – bitte prüfen.":"Nicht sicher erkannt – bitte manuell korrigieren.";
+        }else{
+          const slot=extractSlot(raw);
+          if(slot)document.getElementById("slotValue").value=slot;
+          status.textContent=slot?"Lagerplatz erkannt – bitte prüfen.":"Lagerplatz nicht sicher erkannt.";
+        }
+      }catch(e){status.textContent="Erkennung fehlgeschlagen. Bitte erneut fotografieren oder manuell eintragen.";}
+    }
+    document.getElementById("carrierPhoto").addEventListener("change",e=>runOCR(e.target.files[0],"carrier"));
+    document.getElementById("slotPhoto").addEventListener("change",e=>runOCR(e.target.files[0],"slot"));
+    function resetCarrier(){
+      carrierPhoto.value="";carrierPreview.style.display="none";carrierStatus.textContent="Noch kein Foto.";
+      carrierValue.value="";articleNoValue.value="";articleNameValue.value="";
+    }
+    function resetSlot(){slotPhoto.value="";slotPreview.style.display="none";slotStatus.textContent="Noch kein Foto.";slotValue.value="";}
+    function fillHidden(){
+      carrierHidden.value=carrierValue.value.trim();
+      articleNoHidden.value=articleNoValue.value.trim();
+      articleNameHidden.value=articleNameValue.value.trim();
+      slotHidden.value=slotValue.value.trim();
+      if(!carrierHidden.value||!slotHidden.value){alert("Ladungsträger und Lagerplatz müssen vorhanden sein.");return false;}
+      return true;
+    }
+    </script>
+    """
+    return page(html,"warehouse")
+
+
+@app.route("/camera/confirm", methods=["POST"])
+def camera_confirm():
+    carrier_no=request.form.get("carrier_no","").strip()
+    article_no=request.form.get("article_no","").strip()
+    article_name=request.form.get("article_name","").strip()
+    slot_code=request.form.get("slot_code","").strip()
+
+    c=con()
+    lt=c.execute("SELECT * FROM load_carriers WHERE carrier_no=?",(carrier_no,)).fetchone()
+    article=c.execute("SELECT * FROM articles WHERE article_no=?",(article_no,)).fetchone() if article_no else None
+    c.close()
+
+    warnings=[]
+    if not lt:
+        warnings.append("Ladungsträger ist noch nicht im System angelegt.")
+    else:
+        if article_no and lt["article_no"] and article_no != lt["article_no"]:
+            warnings.append(f'Artikelnummer auf Foto ({article_no}) stimmt nicht mit dem Ladungsträger ({lt["article_no"]}) überein.')
+        if article_name and lt["article_name"] and article_name.lower() not in lt["article_name"].lower() and lt["article_name"].lower() not in article_name.lower():
+            warnings.append("Artikelbezeichnung auf Foto weicht vom gespeicherten Artikel ab.")
+
+    if article_no and not article:
+        warnings.append("Erkannte Artikelnummer ist nicht im Artikelstamm vorhanden.")
+    if not parse_slot(slot_code):
+        warnings.append("Erkannter Lagerplatz ist ungültig.")
+
+    html=f"""
+    <div class="kicker">KAMERA-PRÜFUNG</div><h1 class="page-title">Erkannte Daten bestätigen</h1>
+    <div class="card"><table>
+      <tr><th>Feld</th><th>Erkannt</th><th>System</th></tr>
+      <tr><td>Ladungsträger</td><td><b>{carrier_no or "–"}</b></td><td>{"✓ vorhanden" if lt else "⚠ nicht gefunden"}</td></tr>
+      <tr><td>Artikelnummer</td><td><b>{article_no or "–"}</b></td><td>{"✓ Artikelstamm" if article else ("–" if not article_no else "⚠ unbekannt")}</td></tr>
+      <tr><td>Artikel</td><td>{article_name or "–"}</td><td>{(lt["article_name"] if lt else "–")}</td></tr>
+      <tr><td>Lagerplatz</td><td><b>{slot_code or "–"}</b></td><td>{"✓ gültig" if parse_slot(slot_code) else "⚠ ungültig"}</td></tr>
+    </table></div>
+    """
+    if warnings:
+        html += '<div class="card"><h2 class="warn">Bitte prüfen</h2>'
+        for w in warnings:
+            html += f'<div class="notice">{w}</div>'
+        html += '</div>'
+
+    if lt and parse_slot(slot_code):
+        html += f"""
+        <div class="card">
+          <form method="post" action="/store">
+            <input type="hidden" name="carrier_no" value="{carrier_no}">
+            <input type="hidden" name="slot_code" value="{slot_code}">
+            <button>Mit normaler Lagerprüfung einlagern</button>
+          </form>
+        </div>
+        """
+    html += '<div class="card"><a class="yellow-link" href="/camera">← Neues Foto aufnehmen</a></div>'
+    return page(html,"warehouse")
 
 
 @app.route("/gates")
