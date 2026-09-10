@@ -569,9 +569,9 @@ def bottom_nav(active):
         ("/archive","◷","Archiv","archive"),
         ("/more","⋯","Mehr","more"),
     ]
-    if session.get('role') == 'Admin':
-        pages.append(("/settings","⚙","E-Mail","settings"))
-        pages.append(("/users","♙","Benutzer","users"))
+    # V36 Entwicklungsmodus: Admin-Bereiche direkt sichtbar, kein Login erforderlich.
+    pages.append(("/settings","⚙","E-Mail","settings"))
+    pages.append(("/users","♙","Benutzer","users"))
     html = '<div class="bottom-nav">'
     for url, icon, text, key in pages:
         cls = "active" if active == key else ""
@@ -580,12 +580,11 @@ def bottom_nav(active):
 
 def page(content, active="dashboard"):
     now = datetime.now()
-    logged_in = bool(session.get("user_id"))
-    # Ohne Anmeldung keine Navigation und keine Lagerdaten in der Oberfläche.
-    profile = (f'<div class="profile"><div class="avatar">{(session.get("username") or "LP")[:2].upper()}</div>'
-               f'<div class="datetime">{now.strftime("%d.%m.%Y")}<br>{now.strftime("%H:%M")} Uhr</div></div>') if logged_in else ""
-    nav = bottom_nav(active) if logged_in else ""
-    body_class = "" if logged_in else "auth-only"
+    # V36 Entwicklungsmodus: Oberfläche vollständig ohne Anmeldung anzeigen.
+    profile = (f'<div class="profile"><div class="avatar">DEV</div>'
+               f'<div class="datetime">{now.strftime("%d.%m.%Y")}<br>{now.strftime("%H:%M")} Uhr</div></div>')
+    nav = bottom_nav(active)
+    body_class = ""
     return f"""<!doctype html>
 <html>
 <head>
