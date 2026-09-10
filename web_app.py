@@ -1,4 +1,4 @@
-# LagerPro V30 COMPLETE - Firmenversion
+# LagerPro V31 - Benutzerzugang + sichtbare Mehrfachauswahl
 from flask import Flask, request, redirect, session
 import sqlite3, os, math, json, shutil, secrets
 from datetime import datetime, timedelta
@@ -264,6 +264,9 @@ html,body{
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif
 }
 body{padding-bottom:92px}
+body.auth-only{padding-bottom:0}
+body.auth-only .main{max-width:520px;margin:40px auto;padding:16px}
+body.auth-only .card{box-shadow:0 20px 60px rgba(0,0,0,.28)}
 .topbar{
   position:sticky;top:0;z-index:100;
   background:rgba(6,17,29,.97);
@@ -384,6 +387,7 @@ th{color:#aebed3}
 .page-title{margin:7px 0 15px;font-size:30px}
 .bottom-nav{
   position:fixed;left:0;right:0;bottom:0;z-index:200;
+  overflow-x:auto;
   background:rgba(6,17,29,.98);border-top:1px solid #1d3655;
   display:flex;justify-content:space-around;padding:7px 3px 11px
 }
@@ -513,6 +517,8 @@ def bottom_nav(active):
         ("/archive","◷","Archiv","archive"),
         ("/more","⋯","Mehr","more"),
     ]
+    if session.get('role') == 'Admin':
+        pages.append(("/users","♙","Benutzer","users"))
     html = '<div class="bottom-nav">'
     for url, icon, text, key in pages:
         cls = "active" if active == key else ""
@@ -521,6 +527,12 @@ def bottom_nav(active):
 
 def page(content, active="dashboard"):
     now = datetime.now()
+    logged_in = bool(session.get("user_id"))
+    # Ohne Anmeldung keine Navigation und keine Lagerdaten in der Oberfläche.
+    profile = (f'<div class="profile"><div class="avatar">{(session.get("username") or "LP")[:2].upper()}</div>'
+               f'<div class="datetime">{now.strftime("%d.%m.%Y")}<br>{now.strftime("%H:%M")} Uhr</div></div>') if logged_in else ""
+    nav = bottom_nav(active) if logged_in else ""
+    body_class = "" if logged_in else "auth-only"
     return f"""<!doctype html>
 <html>
 <head>
@@ -528,23 +540,20 @@ def page(content, active="dashboard"):
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="theme-color" content="#07111f">
 <link rel="manifest" href="/manifest.webmanifest">
-<title>Lagerprozess</title>
+<title>LagerPro</title>
 {STYLE}
 </head>
-<body>
+<body class="{body_class}">
 <header class="topbar">
   <div class="top-inner">
     <div class="logo-wrap">
       <img src="{LOGO_DATA}" alt="drive MEDICAL">
     </div>
-    <div class="profile">
-      <div class="avatar">{(session.get("username") or "LP")[:2].upper()}</div>
-      <div class="datetime">{now.strftime("%d.%m.%Y")}<br>{now.strftime("%H:%M")} Uhr</div>
-    </div>
+    {profile}
   </div>
 </header>
 <main class="main">{content}</main>
-{bottom_nav(active)}
+{nav}
 <script>
 if ("serviceWorker" in navigator) {{ navigator.serviceWorker.register("/sw.js").catch(()=>{{}}); }}
 </script>
@@ -1097,18 +1106,22 @@ def warehouse():
     try:l=max(1,min(4,int(request.args.get("level",1))))
     except:l=1
     c=con()
-    slots=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? ORDER BY position",(r,l)).fetchall()
-    occ=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=? AND level=? AND load_carrier_id IS NOT NULL",(r,l)).fetchone()[0]
+    maxpos=89 if r<=7 else 83
+    slots=c.execute("SELECT * FROM warehouse_slots WHERE rack=? AND level=? AND position<=? ORDER BY position",(r,l,maxpos)).fetchall()
+    occ=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=? AND level=? AND position<=? AND load_carrier_id IS NOT NULL",(r,l,maxpos)).fetchone()[0]
+    blocked=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=? AND level=? AND position<=? AND slot_status='gesperrt'",(r,l,maxpos)).fetchone()[0]
+    reserved=c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=? AND level=? AND position<=? AND slot_status='reserviert'",(r,l,maxpos)).fetchone()[0]
+    free=max(0,maxpos-occ-blocked-reserved)
     c.close()
-    ropts="".join(f'<option value="{x}" {"selected" if x==r else ""}>Regal {x}</option>' for x in range(1,31))
+    ropts="".join(f'<option value="{x}" {"selected" if x==r else ""}>Gang {x}</option>' for x in range(1,31))
     lopts="".join(f'<option value="{x}" {"selected" if x==l else ""}>Ebene {x}</option>' for x in range(1,5))
-    html=f"""<div class="kicker">LAGER</div><div class="toolbar"><span class="pill green">GRÜN = FREI</span><span class="pill yellow">GELB = BELEGT</span><span class="pill red">ROT = GESPERRT</span></div><h1 class="page-title">Lagerübersicht</h1><div class="notice"><b>Feste Stellplatzregel:</b> Positionen 21, 22 und 23 sind in jedem Regal 3er-Stellplätze. Alle übrigen Positionen sind 4er-Stellplätze.</div>
-    <div class="card"><form method="get" class="warehouse-toolbar">
-      <div>Regal<select name="rack" onchange="this.form.submit()">{ropts}</select></div>
+    html=f"""<div class="kicker">LAGER</div><div class="toolbar"><span class="pill green">GRÜN = FREI</span><span class="pill yellow">GELB = BELEGT</span><span class="pill red">ROT = GESPERRT</span></div><h1 class="page-title">Lagerübersicht</h1><div class="notice"><b>Lagerstruktur:</b> Gang 1–7 haben jeweils 89 Positionen. Ab Gang 8 gelten 83 Positionen. Positionen 21, 22 und 23 sind in jedem Gang 3er-Stellplätze; alle übrigen Positionen sind 4er-Stellplätze.</div>
+    <div class="card"><div class="section-head"><h2>Ansicht wählen</h2><a class="button" href="/batch-booking?gang={r}&level={l}">☑ Mehrfachauswahl</a></div><form method="get" class="warehouse-toolbar">
+      <div>Gang<select name="rack" onchange="this.form.submit()">{ropts}</select></div>
       <div>Ebene<select name="level" onchange="this.form.submit()">{lopts}</select></div>
     </form><div class="row"><div><span class="muted">Belegt</span><div class="number">{occ}</div></div>
-    <div><span class="muted">Frei</span><div class="number">{83-occ}</div></div></div></div>
-    <div class="card"><div class="section-head"><h2>Regal {r} · Ebene {l}</h2><span class="muted">83 Positionen · 21–23 sind 3er</span></div><div class="slot-grid">"""
+    <div><span class="muted">Frei</span><div class="number">{free}</div></div></div></div>
+    <div class="card"><div class="section-head"><h2>Gang {r} · Ebene {l}</h2><span class="muted">{maxpos} Positionen · 21–23 sind 3er</span></div><div class="slot-grid">"""
     for s in slots:
         code=f'{r}/{l}/{s["position"]}'
         if s["slot_status"]=="gesperrt":
@@ -2120,7 +2133,7 @@ def login():
             try: locked=datetime.fromisoformat(x['locked_until'])>datetime.now()
             except Exception: pass
         if x and x['active'] and not locked and check_password_hash(x['password_hash'],pw):
-            c.execute("UPDATE users SET failed_logins=0,locked_until=NULL WHERE id=?",(x['id'],)); c.commit(); c.close(); session.clear(); session.update(user_id=x['id'],username=x['username'],role=x['role'],last_seen=now_iso()); audit('Login','user',x['id']); return redirect(request.args.get('next') or '/')
+            c.execute("UPDATE users SET failed_logins=0,locked_until=NULL WHERE id=?",(x['id'],)); c.commit(); c.close(); session.clear(); session.update(user_id=x['id'],username=x['username'],role=x['role'],last_seen=now_iso()); audit('Login','user',x['id']); nxt=request.args.get('next') or '/'; return redirect(nxt if nxt.startswith('/') and not nxt.startswith('//') else '/')
         if x:
             f=(x['failed_logins'] or 0)+1; until=(datetime.now()+timedelta(minutes=15)).isoformat(timespec='seconds') if f>=5 else None; c.execute("UPDATE users SET failed_logins=?,locked_until=? WHERE id=?",(f,until,x['id'])); c.commit()
         c.close(); msg='Anmeldung fehlgeschlagen.'
@@ -2139,11 +2152,14 @@ def users_page():
             u=request.form['username'].strip(); role=request.form.get('role','Mitarbeiter'); c.execute("INSERT INTO users(username,password_hash,full_name,role,created_at) VALUES(?,?,?,?,?)",(u,generate_password_hash(request.form['password']),request.form.get('full_name',u),role,now_iso())); c.commit(); audit('Benutzer angelegt','user',u,after={'role':role}); msg='Benutzer angelegt.'
         except Exception as e: msg=str(e)
     rows=c.execute("SELECT * FROM users ORDER BY username").fetchall(); c.close(); trs=''.join(f"<tr><td>{r['username']}</td><td>{r['full_name']}</td><td>{r['role']}</td><td>{'aktiv' if r['active'] else 'inaktiv'}</td></tr>" for r in rows)
-    return page(f'<div class="kicker">ADMIN</div><h1 class="page-title">Benutzer & Rechte</h1><div class="card"><p>{msg}</p><form method="post"><div class="row"><input name="full_name" placeholder="Name" required><input name="username" placeholder="Benutzername" required></div><div class="row"><input type="password" name="password" minlength="8" placeholder="Passwort" required><select name="role"><option>Mitarbeiter</option><option>Lagerleitung</option><option>Admin</option></select></div><button>Benutzer hinzufügen</button></form></div><div class="card"><table><tr><th>Benutzer</th><th>Name</th><th>Rolle</th><th>Status</th></tr>{trs}</table></div>','more')
+    return page(f'<div class="kicker">ADMIN · ZUGANGSVERWALTUNG</div><h1 class="page-title">Benutzer hinzufügen</h1><div class="notice">Ohne Anmeldung sehen Benutzer ausschließlich die Login-Seite. Nach erfolgreicher Anmeldung erhalten sie Zugriff entsprechend ihrer Rolle. Nur Administratoren können diesen Bereich öffnen.</div><div class="card"><h2>Neuen Benutzer anlegen</h2><p>{msg}</p><form method="post"><div class="row"><input name="full_name" placeholder="Name" required><input name="username" placeholder="Benutzername" required></div><div class="row"><input type="password" name="password" minlength="8" placeholder="Startpasswort" required><select name="role"><option>Mitarbeiter</option><option>Lagerleitung</option><option>Admin</option></select></div><button>Benutzer hinzufügen</button></form></div><div class="card"><h2>Vorhandene Benutzer</h2><table><tr><th>Benutzer</th><th>Name</th><th>Rolle</th><th>Status</th></tr>{trs}</table></div>','users')
 
 @app.route('/more')
 def more_page():
-    links=[('/stock','Bestände'),('/batch-booking','Mehrfach-Einlagerung'),('/reservations','Reservierungen'),('/optimizer','Optimierungsassistent'),('/simulation','Lager-Simulation'),('/handover','Schichtübergabe'),('/notifications','Frühwarnsystem'),('/audit','Audit-Historie'),('/backup','Backups'),('/settings','Einstellungen'),('/users','Benutzerverwaltung'),('/logout','Abmelden')]
+    links=[('/stock','Bestände'),('/batch-booking','Mehrfach-Einlagerung'),('/reservations','Reservierungen'),('/optimizer','Optimierungsassistent'),('/simulation','Lager-Simulation'),('/handover','Schichtübergabe'),('/notifications','Frühwarnsystem')]
+    if role_allowed('Admin'):
+        links += [('/audit','Audit-Historie'),('/backup','Backups'),('/settings','Einstellungen'),('/users','Benutzerverwaltung')]
+    links.append(('/logout','Abmelden'))
     cards=''.join(f'<a class="action-card" href="{u}"><b>{t}</b><span class="muted">Öffnen</span></a>' for u,t in links)
     return page(f'<div class="kicker">ERWEITERUNGEN</div><h1 class="page-title">LagerPro Complete</h1><div class="action-grid">{cards}</div>','more')
 
