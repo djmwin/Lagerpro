@@ -2,4 +2,4 @@
 nixPkgs = ["python311"]
 
 [start]
-cmd = "python web_app.py"
+cmd = "gunicorn --workers 1 --threads 4 --timeout 120 --access-logfile - web_app:app"
