@@ -1,5 +1,18 @@
 # Änderungsprotokoll
 
+## V39
+
+- echte SQLite-/PostgreSQL-Datenbankschicht und Schema-Version
+- CSRF, sichere Cookies, Proxy-HTTPS und HTTP-Sicherheitsheader
+- Rollenprüfung für Leitungs- und Adminbereiche
+- atomarer Schutz gegen doppelte Container-Fertigmails
+- vollständige Bewegungsdaten und Euro-/Einweg-Prüfung bei Direktbuchungen
+- getrennte E-Mail-Empfänger und Wiederholung fehlgeschlagener Nachbestellmails
+- SMTP-Passwörter ausschließlich aus geschützten Umgebungsvariablen
+- installierbare PWA mit App-Symbol und Offline-Hinweis
+- CI-Tests für SQLite und PostgreSQL
+- nicht-destruktives Werkzeug zur Übernahme bestehender SQLite-Daten
+
 ## V38
 
 - Railway-PostgreSQL über `DATABASE_URL`

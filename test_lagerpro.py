@@ -29,8 +29,17 @@ class LagerProTests(unittest.TestCase):
         c.commit()
         c.close()
         self.client = self.app.test_client()
-        self.client.post("/setup", data={"full_name":"Admin", "username":"admin", "password":"sicheres-passwort"})
-        self.client.post("/login", data={"username":"admin", "password":"sicheres-passwort"})
+        self.client.get("/setup")
+        self.client.post("/setup", data={"csrf_token":self.csrf(), "full_name":"Admin", "username":"admin", "password":"sicheres-passwort"})
+        self.client.get("/login")
+        self.client.post("/login", data={"csrf_token":self.csrf(), "username":"admin", "password":"sicheres-passwort"})
+
+    def csrf(self):
+        with self.client.session_transaction() as sess:
+            return sess["csrf_token"]
+
+    def post(self, url, data):
+        return self.client.post(url, data={"csrf_token": self.csrf(), **data})
 
     def test_warehouse_layout_and_capacities(self):
         c = self.module.con()
@@ -41,12 +50,12 @@ class LagerProTests(unittest.TestCase):
         c.close()
 
     def test_article_master_and_manual_booking_create_complete_movement(self):
-        response = self.client.post("/articles", data={
+        response = self.post("/articles", {
             "no":"A-100", "name":"Testartikel", "units_per_carton":"12",
             "cartons_per_pallet":"20", "ptype":"Euro", "rule":"Alle Ebenen",
         })
         self.assertEqual(response.status_code, 302)
-        response = self.client.post("/manual-booking", data={
+        response = self.post("/manual-booking", {
             "article_no":"A-100", "article_name":"Testartikel",
             "cartons_on_pallet":"20", "slot_code":"1/1/1",
         })
@@ -61,10 +70,10 @@ class LagerProTests(unittest.TestCase):
         c.close()
 
     def test_manual_booking_rejects_mixed_neighbor_pallet_types(self):
-        self.client.post("/articles", data={"no":"EU", "name":"Euro", "units_per_carton":"1", "cartons_per_pallet":"1", "ptype":"Euro", "rule":"Alle Ebenen"})
-        self.client.post("/articles", data={"no":"EW", "name":"Einweg", "units_per_carton":"1", "cartons_per_pallet":"1", "ptype":"Einweg", "rule":"Alle Ebenen"})
-        self.client.post("/manual-booking", data={"article_no":"EU", "article_name":"Euro", "cartons_on_pallet":"1", "slot_code":"1/1/10"})
-        response = self.client.post("/manual-booking", data={"article_no":"EW", "article_name":"Einweg", "cartons_on_pallet":"1", "slot_code":"1/1/11"})
+        self.post("/articles", {"no":"EU", "name":"Euro", "units_per_carton":"1", "cartons_per_pallet":"1", "ptype":"Euro", "rule":"Alle Ebenen"})
+        self.post("/articles", {"no":"EW", "name":"Einweg", "units_per_carton":"1", "cartons_per_pallet":"1", "ptype":"Einweg", "rule":"Alle Ebenen"})
+        self.post("/manual-booking", {"article_no":"EU", "article_name":"Euro", "cartons_on_pallet":"1", "slot_code":"1/1/10"})
+        response = self.post("/manual-booking", {"article_no":"EW", "article_name":"Einweg", "cartons_on_pallet":"1", "slot_code":"1/1/11"})
         self.assertIn("dürfen nicht direkt nebeneinander", response.get_data(as_text=True))
         c = self.module.con()
         self.assertIsNone(c.execute("SELECT load_carrier_id FROM warehouse_slots WHERE rack=1 AND level=1 AND position=11").fetchone()[0])

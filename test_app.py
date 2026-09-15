@@ -40,7 +40,7 @@ def setup_and_login(client):
 def test_health_and_warehouse_layout():
     client = web_app.app.test_client()
     health = client.get("/api/health").get_json()
-    assert health == {"ok": True, "database": True, "database_backend": "sqlite", "version": "V38"}
+    assert health == {"ok": True, "database": True, "database_backend": "sqlite", "version": "V39"}
     c = web_app.con()
     assert c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=1").fetchone()[0] == 356
     assert c.execute("SELECT COUNT(*) FROM warehouse_slots WHERE rack=8").fetchone()[0] == 332
@@ -87,3 +87,30 @@ def test_admin_pages_smoke_test():
     for route in routes:
         response = client.get(route)
         assert response.status_code < 500, (route, response.status_code)
+
+
+def test_security_headers_and_cookie_policy():
+    client = web_app.app.test_client()
+    response = client.get("/api/health", base_url="https://lagerpro.example")
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
+    assert response.headers["Strict-Transport-Security"].startswith("max-age=")
+    cookie = response.headers.get("Set-Cookie", "")
+    assert "HttpOnly" in cookie
+    assert "SameSite=Lax" in cookie
+
+
+def test_role_boundaries_and_state_changes_require_post():
+    client = web_app.app.test_client()
+    client.get("/login")
+    with client.session_transaction() as sess:
+        sess.update(user_id=999, username="worker", role="Mitarbeiter", csrf_token="test-token")
+    assert client.get("/purchasing").status_code == 403
+    assert client.get("/task/1/done").status_code == 405
+    assert client.get("/logout").status_code == 405
+
+
+def test_markup_in_request_is_rejected():
+    client = web_app.app.test_client()
+    assert client.get("/search?q=%3Cscript%3Ebad%3C/script%3E").status_code == 400
